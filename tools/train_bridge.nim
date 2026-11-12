@@ -65,9 +65,17 @@ when isMainModule:
       response = %*{"response": $action}
     of "step":
       doAssert not game.done and request["decision_id"].getInt() == id
-      let action = parseJson(request["response"].getStr())
-      decisions[seat] = parseDecision(game, seat, action)
-      let installed = decisionJson(game, decisions[seat])
+      var installed: JsonNode
+      try:
+        let action = extractJsonObject(request["response"].getStr())
+        decisions[seat] = parseDecision(game, seat, action)
+        installed = decisionJson(game, decisions[seat])
+      except CatchableError as error:
+        response = %*{"kind": "rejected", "reason": error.msg,
+          "observation": game.observation(seat, id, selection)}
+        stdout.writeLine($response)
+        stdout.flushFile()
+        continue
       inc id
       var next: JsonNode
       if seat == Seats - 1:
