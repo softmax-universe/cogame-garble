@@ -92,8 +92,20 @@ def play(variant, seed, wording="canonical", prompt_seed=0, notes=False):
                     action["confirm"]["price"] = str(action["confirm"]["price"])
                     action["confirm"]["side"] = action["confirm"]["side"].lower()
             trace.append((view, messages[1]["content"], expected))
+            if wording == "canonical" and index == 0 and not notes:
+                for invalid in ("not JSON", '{"confirm": {}}'):
+                    rejected = request(
+                        {"kind": "step", "decision_id": index, "response": invalid}
+                    )
+                    assert rejected["kind"] == "rejected" and rejected["reason"]
+                    assert rejected["observation"]["decision_id"] == index
+            formatted = (
+                f"```json\n{json.dumps(action)}\n```"
+                if index % 2 == 0
+                else json.dumps(action)
+            )
             response = request(
-                {"kind": "step", "decision_id": index, "response": json.dumps(action)}
+                {"kind": "step", "decision_id": index, "response": formatted}
             )
             assert response["kind"] == "accepted" and response["action"] == expected
             observation = response["observation"]
