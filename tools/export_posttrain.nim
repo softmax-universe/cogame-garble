@@ -68,7 +68,7 @@ when isMainModule:
         doAssert parsed == teacher
         decisions.add(parsed)
         let system = selection.ordinarySystemPrompt()
-        let user = $view & "\n" & OperatorPrompt
+        let user = $view & "\n" & OperatorPrompt & "\n" & ActionReplyInstruction
         rows.add($(%*{
           "episode_id": "garble-" & variant & "-" & $seed & "-" & $selection.variant & "-" &
             $selection.selectedVariant & "-" & $selection.seed,

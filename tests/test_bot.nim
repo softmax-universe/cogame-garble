@@ -217,6 +217,29 @@ suite "reply parsing":
       """Here you go: {"text":"SELL 5 ORE AT 12"} — hope that helps.""")
     check decision.text == "SELL 5 ORE AT 12"
 
+  test "extractJsonObject handles UTF-8 BOM, fences, string braces, and braced trailing prose":
+    let sim = sample()
+    let bomAndBracedProse = "\xEF\xBB\xBF```json\n" &
+      """{"channel":"RADIO","text":"SELL 5 ORE AT 12","confirm":{"ticket":2,"side":"SELL","commodity":"ORE","qty":5,"price":12},"notes":"watch \"{\" and } in strings"}""" &
+      "\n```\nExtra note with {braces: 1} after fence."
+    let d1 = sim.decide(bomAndBracedProse)
+    check d1.hasConfirm
+    check d1.ticket == 2
+    check d1.notes == """watch "{" and } in strings"""
+
+    let unfencedBracedProse =
+      """{"channel":"RADIO","text":"BUY 3 TIN AT 20","confirm":null,"notes":"ok {still inside}"} trailing {not: json}"""
+    let d2 = sim.decide(unfencedBracedProse)
+    check not d2.hasConfirm
+    check d2.text == "BUY 3 TIN AT 20"
+    check d2.notes == "ok {still inside}"
+
+    expect GarbleError:
+      discard extractJsonObject("\xEF\xBB\xBF{\"text\":\"unclosed\"")
+
+    check "\"ticket\":<id>" in ActionReplyInstruction
+    check "never at top level" in ActionReplyInstruction
+
   test "ill-formed confirms are rejected":
     let sim = sample()
     for body in ["""{"confirm":{"ticket":1,"side":"SELL","commodity":"ORE",

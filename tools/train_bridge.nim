@@ -12,7 +12,7 @@ proc seedOf(value: string): int =
 proc observation(game: Sim, seat, id: int, selection: PromptSelection): JsonNode =
   let view = game.seatDecisionView(seat)
   let system = selection.ordinarySystemPrompt()
-  let user = $view & "\n" & OperatorPrompt
+  let user = $view & "\n" & OperatorPrompt & "\n" & ActionReplyInstruction
   view["prompt_template"] = selection.promptMetadata(system, user)
   %*{"kind": "decision", "game": "garble", "decision_id": id,
     "seat": seat, "engine_seat": seat, "turn": game.turn,
@@ -21,7 +21,17 @@ proc observation(game: Sim, seat, id: int, selection: PromptSelection): JsonNode
     "speech_messages": [], "typed_question": newJNull(),
     "action_schema": {"type": "object", "properties": {
       "channel": {"type": "string"}, "text": {"type": "string"},
-      "notes": {"type": "string"}, "confirm": {"type": ["object", "null"]}}}}
+      "notes": {"type": "string"}, "confirm": {
+        "type": ["object", "null"],
+        "properties": {
+          "ticket": {"type": "integer"},
+          "side": {"type": "string", "enum": ["SELL", "BUY"]},
+          "commodity": {"type": "string", "enum": ["ORE", "OAT", "TIN", "TAR"]},
+          "qty": {"type": "integer"},
+          "price": {"type": "integer"}
+        },
+        "required": ["ticket", "side", "commodity", "qty", "price"]
+      }}}}
 
 when isMainModule:
   let args = commandLineParams()

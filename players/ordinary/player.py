@@ -10,6 +10,12 @@ import websocket
 from capture import Capture
 
 COMMODITIES = ("ORE", "OAT", "TIN", "TAR")
+ACTION_REPLY_INSTRUCTION = (
+    'Reply with ONLY {"channel":"RADIO" or "<cog>","text":"...",'
+    '"confirm":null or {"ticket":<id>,"side":"SELL"|"BUY",'
+    '"commodity":"ORE"|"OAT"|"TIN"|"TAR","qty":<int>,"price":<int>},'
+    '"notes":"..."} (put ticket, side, commodity, qty, and price inside confirm, never at top level).'
+)
 
 
 def baseline_action(view: dict, shark: bool) -> dict:
@@ -88,11 +94,12 @@ def baseline_action(view: dict, shark: bool) -> dict:
 
 
 def choose(turn: dict, generator) -> tuple[dict, str]:
-    turn["user"] = (
-        json.dumps(turn["view"], separators=(",", ":"), ensure_ascii=False)
-        + "\n"
-        + os.environ.get("PLAYER_PROMPT", "")
-    )
+    operator_prompt = os.environ.get("PLAYER_PROMPT", "")
+    parts = [json.dumps(turn["view"], separators=(",", ":"), ensure_ascii=False)]
+    if operator_prompt:
+        parts.append(operator_prompt)
+    parts.append(ACTION_REPLY_INSTRUCTION)
+    turn["user"] = "\n".join(parts)
     if generator:
         completion = generator(
             [
