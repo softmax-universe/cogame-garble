@@ -408,6 +408,13 @@ no explanation, no markdown fences, no text before or after the object. Your
 reply must begin with the character { and end with }.""")
 
 
+const ActionReplyInstruction* =
+  "Reply with ONLY {\"channel\":\"RADIO\" or \"<cog>\",\"text\":\"...\"," &
+  "\"confirm\":null or {\"ticket\":<id>,\"side\":\"SELL\"|\"BUY\"," &
+  "\"commodity\":\"ORE\"|\"OAT\"|\"TIN\"|\"TAR\",\"qty\":<int>," &
+  "\"price\":<int>},\"notes\":\"...\"} (put ticket, side, commodity, qty, " &
+  "and price inside confirm, never at top level)."
+
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
     return ""
@@ -416,20 +423,68 @@ proc operatorBlock(prompt: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
+proc unwrapMarkdownFence(text: string): string =
+  let openIdx = text.find("```")
+  if openIdx < 0:
+    return ""
+  let newlineIdx = text.find('\n', openIdx + 3)
+  if newlineIdx < 0:
+    return ""
+  let bodyStart = newlineIdx + 1
+  let closeIdx = text.find("```", bodyStart)
+  if closeIdx <= bodyStart:
+    return ""
+  text[bodyStart ..< closeIdx].strip()
+
+proc findBalancedJsonObject(text: string, fromIdx = 0): tuple[start, stop: int] =
+  let start = text.find('{', fromIdx)
+  if start < 0:
+    return (-1, -1)
+  var depth = 0
+  var inString = false
+  var escaped = false
+  for idx in start ..< text.len:
+    let ch = text[idx]
+    if inString:
+      if escaped:
+        escaped = false
+      elif ch == '\\':
+        escaped = true
+      elif ch == '"':
+        inString = false
+    else:
+      if ch == '"':
+        inString = true
+      elif ch == '{':
+        inc depth
+      elif ch == '}':
+        dec depth
+        if depth == 0:
+          return (start, idx)
+  (-1, -1)
+
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first {...} object out of a model response, tolerating fences
-  ## and trailing prose.
-  let start = text.find('{')
-  let stop = text.rfind('}')
+  ## Pulls the first balanced {...} object out of a model response, tolerating
+  ## UTF-8 BOMs, markdown code fences, braces inside JSON strings, and trailing
+  ## prose (even if trailing prose contains braces).
+  var cleaned = text
+  if cleaned.startsWith("\xEF\xBB\xBF"):
+    cleaned = cleaned[3 .. ^1]
+  let fenced = unwrapMarkdownFence(cleaned)
+  let candidate = if fenced.len > 0 and '{' in fenced: fenced else: cleaned
+  let (start, stop) = findBalancedJsonObject(candidate)
   if start < 0 or stop <= start:
     ## Quote the head of the reply so a hosted log shows WHAT the model sent
     ## instead of JSON (prose, a refusal, a cut-off analysis...).
-    var head = text.strip()
+    var head = cleaned.strip()
     if head.len > 160:
       head = head[0 ..< 160] & "..."
     raise newException(GarbleError, "no JSON object in response: " &
       head.replace("\n", " "))
-  parseJson(text[start .. stop])
+  let parsed = parseJson(candidate[start .. stop])
+  if parsed.kind != JObject:
+    raise newException(GarbleError, "JSON response must be an object")
+  parsed
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -597,9 +652,7 @@ proc choosePromptAction*(client: LlmClient, view: JsonNode, prompt: string,
     timeoutSeconds, slot: int, selection: PromptSelection,
     capture: PrivateCapture = nil): JsonNode =
   let system = systemPrompt(view["alias"].getStr(), selection)
-  let user = $view & "\n\n" & operatorBlock(prompt) &
-    "Reply with ONLY a JSON object containing channel, text, confirm " &
-    "(an object or null), and notes."
+  let user = $view & "\n\n" & operatorBlock(prompt) & ActionReplyInstruction
   var request = client.requestFor(system, user, -1)
   if client.transport == ltSidecar:
     request.headers["x-coworld-player-slot"] = $slot
