@@ -246,6 +246,8 @@ jobs:
                   for token in argv:
                       cmd += ["--run", token]
                   for key, value in (row.get("env") or {}).items():
+                      if key == "USE_BEDROCK":
+                          continue
                       cmd += ["--secret-env", f"{key}={value}"]
                   # The command is NOT echoed: --secret-env values are policy secrets.
                   print(f"::group::upload-policy {name} ({image}) as {player or 'the token owner'}",
