@@ -394,7 +394,7 @@ const ActionReplyInstruction* =
   "{\"channel\":\"RADIO\",\"text\":\"SELL 2 TIN AT 9\"}. " &
   "To confirm a ticket add \"confirm\":{\"ticket\":1,\"side\":\"SELL\"," &
   "\"commodity\":\"TIN\",\"qty\":2,\"price\":9}, using the actual ticket and terms. " &
-  "Private notes are optional."
+  "Use the optional \"notes\" string for private memory."
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -510,9 +510,8 @@ proc parseIntField(node: JsonNode, field: string, minVal, maxVal: int): int =
 proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
   if payload.isNil or payload.kind != JObject:
     raise newException(GarbleError, "decision action must be an object")
-  for key in payload.keys:
-    if key notin ["channel", "text", "notes", "confirm"]:
-      raise newException(GarbleError, "unknown decision field: " & key)
+  if not hasUnambiguousAction(payload):
+    raise newException(GarbleError, "reply must identify one documented action")
   result.channel = parseChannel(sim, seat, payload{"channel"})
   let textNode = payload{"text"}
   if not textNode.isNil:

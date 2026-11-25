@@ -230,6 +230,18 @@ proc suppliedFieldsEqual(raw, actual: JsonNode): bool =
     return true
   raw == actual
 
+const ActionFields* = ["text", "channel", "confirm", "notes"]
+
+proc hasUnambiguousAction*(raw: JsonNode): bool =
+  if raw.isNil or raw.kind != JObject: return false
+  var hasExtra = false
+  var hasAction = false
+  for key in raw.keys:
+    if key in ["ticket", "side", "commodity", "qty", "price"]: return false
+    if key notin ActionFields: hasExtra = true
+    if key in ["text", "confirm"]: hasAction = true
+  not hasExtra or hasAction
+
 proc suppliedActionMatches*(raw, actual: JsonNode, notesClipped: var bool,
     notesPriorRetained: var bool): bool =
   ## Game action fields (channel, text, confirm) must match strictly without
@@ -239,7 +251,9 @@ proc suppliedActionMatches*(raw, actual: JsonNode, notesClipped: var bool,
   notesPriorRetained = false
   if raw == nil or actual == nil or raw.kind != JObject or actual.kind != JObject:
     return false
+  if not hasUnambiguousAction(raw): return false
   for key, value in raw:
+    if key notin ActionFields: continue
     if not actual.hasKey(key):
       return false
     if key == "notes":

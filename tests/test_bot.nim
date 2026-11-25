@@ -241,8 +241,10 @@ suite "reply parsing":
       expect GarbleError:
         discard extractJsonObject(bad)
 
-  test "legacy coercions, unknown channels, and unknown keys are rejected":
+  test "complete orders permit metadata and reject ambiguous or invalid actions":
     let sim = sample()
+    let radio = sim.decide("""{"channel":"RADIO","text":"SELL 2 TIN AT 9","comment":"my extra description"}""")
+    check radio.channel == Radio and radio.text == "SELL 2 TIN AT 9"
     for body in [
       """{"channel":"radio","text":"x"}""",
       """{"channel":"Nobody","text":"x"}""",
