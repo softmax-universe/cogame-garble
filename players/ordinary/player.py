@@ -11,10 +11,11 @@ from capture import Capture
 
 COMMODITIES = ("ORE", "OAT", "TIN", "TAR")
 ACTION_REPLY_INSTRUCTION = (
-    'Reply with ONLY {"channel":"RADIO" or "<cog>","text":"...",'
-    '"confirm":null or {"ticket":<id>,"side":"SELL"|"BUY",'
-    '"commodity":"ORE"|"OAT"|"TIN"|"TAR","qty":<int>,"price":<int>},'
-    '"notes":"..."} (put ticket, side, commodity, qty, and price inside confirm, never at top level).'
+    'Put your action in a final JSON block, for example '
+    '{"channel":"RADIO","text":"SELL 2 TIN AT 9"}. '
+    'To confirm a ticket add "confirm":{"ticket":1,"side":"SELL",'
+    '"commodity":"TIN","qty":2,"price":9}, using the actual ticket and terms. '
+    'Use the optional "notes" string for private memory.'
 )
 
 
@@ -94,10 +95,14 @@ def baseline_action(view: dict, shark: bool) -> dict:
 
 
 def extract_json_object(text: str) -> dict:
-    """Parse one JSON object, bare or inside a single ordinary outer Markdown code fence."""
+    """Parse one JSON object, bare or inside a designated final Markdown code fence."""
     cleaned = text.removeprefix("\ufeff").strip()
     if not cleaned:
         raise ValueError("empty Garble model response")
+    if not cleaned.startswith("```"):
+        opening = cleaned.find("\n```")
+        if opening >= 0 and not cleaned.startswith("{"):
+            cleaned = cleaned[opening + 1 :]
     body = cleaned
     if cleaned.startswith("```"):
         newline = cleaned.find("\n")

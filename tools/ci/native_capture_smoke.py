@@ -276,6 +276,7 @@ def main():
         "COGAME_CONFIG_URI": (out / "config.json").as_uri(),
         "COGAME_RESULTS_URI": (out / "results.json").as_uri(),
         "COGAME_SAVE_REPLAY_URI": (out / "replay.json").as_uri(),
+        "COGAME_PLAYER_FAILURE_URI": (out / "player_failure.json").as_uri(),
         "COWORLD_EPISODE_ID": "local-synthetic-garble-capture",
         "COWORLD_GAME_VERSION": "local-proof-only",
         "COWORLD_SOURCE_REVISION": "local-uncommitted-proof",
@@ -458,6 +459,9 @@ def main():
         observer.join(timeout=2)
         if not expected_fail:
             assert not failures, failures
+            assert not (out / "player_failure.json").exists(), (
+                f"completed episode {args.case} must not write player_failure.json"
+            )
             results = json.loads((out / "results.json").read_text())
             replay = json.loads((out / "replay.json").read_text())
             says = [event for event in replay["events"] if event["kind"] == "say"]
@@ -477,6 +481,18 @@ def main():
             assert not (out / "results.json").exists(), (
                 f"unscored failed episode {args.case} must not write results.json"
             )
+            pf_path = out / "player_failure.json"
+            assert pf_path.exists(), (
+                f"unscored failed episode {args.case} must write player_failure.json"
+            )
+            pf = json.loads(pf_path.read_text())
+            if args.case == "malformed":
+                assert set(pf.keys()) == {"message", "failed_policy_index"}
+                assert pf["failed_policy_index"] == 0
+            else:
+                assert set(pf.keys()) == {"kind", "message", "failed_policy_index"} and pf["failed_policy_index"] == 0
+                assert pf["kind"] == "episode_inconclusive"
+            assert isinstance(pf["message"], str) and pf["message"]
             results = None
             says = []
         counts = {

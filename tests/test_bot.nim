@@ -4,7 +4,7 @@
 ## trade. Also tests strict JSON extraction and decision parsing.
 
 import std/[algorithm, base64, json, monotimes, options, os, strutils, times, unicode, unittest]
-import garble/[llm, sim, training_capture]
+import garble/[llm, server, sim, training_capture]
 
 proc fixture(seed: int, turns = 12, noiseScale = 1.0): GameConfig =
   result = defaultGameConfig()
@@ -416,3 +416,20 @@ suite "native capture acceptance and Nov 25 live responses":
     check strictRawObject("```json\n{\"text\":\"SELL 5 ORE AT 12\",\"confirm\":null}\n```")["text"].getStr() == "SELL 5 ORE AT 12"
     expect ValueError:
       discard strictRawObject("Here is my move: {\"text\":\"SELL 5 ORE AT 12\"}")
+
+suite "player failure wire artifact":
+  test "attributable policy failures emit message and failed_policy_index":
+    let payload = playerFailureJson("rejected_action",
+      "seat 2 turn 1: invalid channel: Nobody", 2)
+    check payload.len == 2
+    check payload["message"].getStr() == "seat 2 turn 1: invalid channel: Nobody"
+    check payload["failed_policy_index"].getInt() == 2
+    check not payload.hasKey("kind")
+
+  test "provider failures name the interrupted seat and remain inconclusive":
+    let payload = playerFailureJson("infra_failure", "deadline exceeded", 3)
+    check payload["kind"].getStr() == "episode_inconclusive"
+    check payload["failed_policy_index"].getInt() == 3
+    check payload["message"].getStr() == "deadline exceeded"
+    check playerFailureJson("infra_failure", "game error", -1).isNil
+    check playerFailureJson("rejected_action", "unknown seat", Seats).isNil

@@ -82,6 +82,7 @@ def run_episode(
     seed: int = 52000,
     seat0_env_override: dict[str, str] | None = None,
     all_scripted_ids: list[str] | None = None,
+    game_env_override: dict[str, str] | None = None,
 ) -> tuple[int, Path]:
     out = Path(tempfile.mkdtemp(prefix=f"garble-rt-{case}-"))
     model = None
@@ -140,10 +141,13 @@ def run_episode(
         "COGAME_RESULTS_URI": (out / "results.json").as_uri(),
         "COGAME_SAVE_REPLAY_URI": (out / "replay.json").as_uri(),
         "COGAME_SAVE_TRAJECTORY_URI": (out / "trajectory.jsonl").as_uri(),
+        "COGAME_PLAYER_FAILURE_URI": (out / "player_failure.json").as_uri(),
         "COWORLD_EPISODE_ID": f"rt-{case}",
         "COWORLD_GAME_VERSION": "0.1.7",
         "COWORLD_SOURCE_REVISION": "local-rt",
     }
+    if game_env_override:
+        game_env.update(game_env_override)
     procs: list[subprocess.Popen] = []
     handles = []
     try:
@@ -212,6 +216,7 @@ def main() -> None:
         game_bin, player_bin, "nov25-live", lambda view: (200, nov25[view["turn"]])
     )
     assert rc == 0, f"nov25-live failed: {(out / 'game.log').read_text()}"
+    assert not (out / "player_failure.json").exists(), "completed episode must not write player_failure.json"
     results = json.loads((out / "results.json").read_text())
     assert results["reason"] == "complete" and len(results["scores"]) == 5
     rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
@@ -258,20 +263,71 @@ def main() -> None:
         rc, out = run_episode(game_bin, player_bin, label, lambda _v, t=bad_text: (200, t), turns=6, seed=11)
         assert rc != 0, f"{label} unexpectedly succeeded"
         assert not (out / "results.json").exists(), f"{label} wrote results.json"
+        pf_path = out / "player_failure.json"
+        assert pf_path.exists(), f"{label} did not write player_failure.json"
+        pf = json.loads(pf_path.read_text())
+        assert set(pf.keys()) == {"message", "failed_policy_index"}, f"{label}: unexpected wire failure keys {pf}"
+        assert pf["failed_policy_index"] == 0, f"{label}: unexpected failed_policy_index {pf}"
+        assert isinstance(pf["message"], str) and pf["message"], f"{label}: empty message {pf}"
         rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
         assert rows[-1]["status"] == "failed"
         assert rows[-1]["participant_outcomes"] is None
         assert rows[-1]["outcome"]["failure_kind"] == "rejected_action"
         s0_t0 = next(r for r in rows[:-1] if r["decision_id"] == "0-0")
         assert s0_t0["action_status"] == "rejected" and s0_t0["executed_action"] is None
-    print("PASS 3/5: Invalid/ambiguous objects terminate unscored with rejected_action")
+    print("PASS 3/5: Invalid/ambiguous objects terminate unscored with rejected_action and GamePlayerFailure")
 
     # 4. Provider / infra failures (HTTP 429, Bedrock 403 without fallback, and no-credentials)
+    def assert_inconclusive_wire(out_dir: Path, label: str) -> None:
+        pf_path = out_dir / "player_failure.json"
+        assert pf_path.exists(), f"{label} did not write player_failure.json"
+        pf = json.loads(pf_path.read_text())
+        assert set(pf.keys()) == {"kind", "message", "failed_policy_index"} and pf["failed_policy_index"] == 0, f"{label}: unexpected wire failure keys {pf}"
+        assert pf["kind"] == "episode_inconclusive", f"{label}: unexpected kind {pf}"
+        assert isinstance(pf["message"], str) and pf["message"], f"{label}: empty message {pf}"
+
     rc, out = run_episode(game_bin, player_bin, "http429", lambda _v: (429, "rate limit"), turns=6, seed=11)
     assert rc != 0 and not (out / "results.json").exists()
+    assert_inconclusive_wire(out, "http429")
     rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
     assert rows[-1]["status"] == "failed" and rows[-1]["participant_outcomes"] is None
     assert rows[-1]["outcome"]["failure_kind"] == "infra_failure"
+
+    # Also verify HTTP POST artifact upload via COGAME_PLAYER_FAILURE_METHOD=POST
+    posted_failures: list[tuple[str, dict]] = []
+
+    class FailureUploadHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            raw = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            posted_failures.append((self.headers.get("Content-Type", ""), json.loads(raw)))
+            self.send_response(200)
+            self.end_headers()
+
+        def log_message(self, *_args):
+            pass
+
+    upload_srv = ThreadingHTTPServer(("127.0.0.1", free_port()), FailureUploadHandler)
+    threading.Thread(target=upload_srv.serve_forever, daemon=True).start()
+    try:
+        rc, out = run_episode(
+            game_bin,
+            player_bin,
+            "http-post-failure",
+            lambda _v: (200, '{"channel":"Nobody","text":"SELL 5 ORE AT 12"}'),
+            turns=6,
+            seed=11,
+            game_env_override={
+                "COGAME_PLAYER_FAILURE_URI": f"http://127.0.0.1:{upload_srv.server_port}/player_failure.json",
+                "COGAME_PLAYER_FAILURE_METHOD": "POST",
+            },
+        )
+    finally:
+        upload_srv.shutdown()
+    assert rc != 0 and not (out / "results.json").exists()
+    assert len(posted_failures) == 1
+    assert posted_failures[0][0] == "application/json"
+    assert set(posted_failures[0][1].keys()) == {"message", "failed_policy_index"}
+    assert posted_failures[0][1]["failed_policy_index"] == 0
 
     bedrock_paths: list[str] = []
 
@@ -307,6 +363,7 @@ def main() -> None:
     finally:
         bedrock_srv.shutdown()
     assert rc != 0 and not (out / "results.json").exists()
+    assert_inconclusive_wire(out, "bedrock403")
     rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
     assert rows[-1]["status"] == "failed" and rows[-1]["participant_outcomes"] is None
     assert rows[-1]["outcome"]["failure_kind"] == "infra_failure"
@@ -316,10 +373,11 @@ def main() -> None:
 
     rc, out = run_episode(game_bin, player_bin, "no-creds", None, turns=6, seed=11, seat0_env_override={})
     assert rc != 0 and not (out / "results.json").exists()
+    assert_inconclusive_wire(out, "no-creds")
     rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
     assert rows[-1]["status"] == "failed" and rows[-1]["participant_outcomes"] is None
     assert rows[-1]["outcome"]["failure_kind"] == "infra_failure"
-    print("PASS 4/5: Provider/infra failures (429, Bedrock 403 no-fallback, no-creds) terminate unscored")
+    print("PASS 4/5: Provider/infra failures (429, Bedrock 403 no-fallback, no-creds) terminate unscored with episode_inconclusive")
 
     # 5. Manifest certification seats every declared player ID; separate offline scripted fixture completes
     manifest = json.loads((ROOT / "coworld_manifest_template.json").read_text())

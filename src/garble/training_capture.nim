@@ -302,7 +302,8 @@ proc newRuntimeCapture*(sim: Sim): RuntimeCapture =
     if not scalarUtf8(getEnv(key)):
       raise newException(ValueError, "non-Unicode private trajectory identity: " & key)
   let privateUri = getEnv(CogameSaveTrajectoryUriEnv)
-  for publicUri in [getEnv("COGAME_RESULTS_URI"), getEnv("COGAME_SAVE_REPLAY_URI")]:
+  for publicUri in [getEnv("COGAME_RESULTS_URI"), getEnv("COGAME_SAVE_REPLAY_URI"),
+      getEnv("COGAME_PLAYER_FAILURE_URI")]:
     if publicUri.len == 0: continue
     if privateUri == publicUri or (not privateUri.isHttpCogameUri() and
         not publicUri.isHttpCogameUri() and

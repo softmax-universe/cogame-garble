@@ -40,7 +40,10 @@ An ordinary player with canned and trained-adapter backends is in
 Two built-in **scripted baselines** — `quoter`, the honest repeater, and
 `shark`, the terse opportunist — submit their own actions from the player
 process. Missing, timed-out, failed, or invalid actions terminate the
-unfinished episode unscored with no substituted move or invented forfeit.
+unfinished episode unscored with no substituted move or invented forfeit,
+writing the Coworld `GamePlayerFailure` artifact to `COGAME_PLAYER_FAILURE_URI`
+(`{message, failed_policy_index}` on attributable policy failures or
+`kind: "episode_inconclusive"` on infrastructure failures) when configured.
 
 Seats play under **anonymous cog aliases** (Sprocket, Gizmo, …): policy
 display names never reach the agents' prompts. The spectator and replay

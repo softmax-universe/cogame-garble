@@ -271,11 +271,20 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "garble: episode complete, shutting down"
   quit(0)
 
+proc playerFailureJson*(failureKind, reason: string, failedSeat = -1): JsonNode =
+  if failedSeat notin 0 ..< Seats:
+    return nil
+  let message = if reason.len > 0: safeDiagnostic(reason) else: failureKind
+  result = %*{"message": cleanText(message, 2000), "failed_policy_index": failedSeat}
+  if failureKind != "rejected_action":
+    result["kind"] = %"episode_inconclusive"
+
 proc failEpisode(runtimeConfig: RuntimeConfig, failureKind, reason: string,
     failedSeat = -1) =
   ## Terminate an unfinished episode unscored with no invented winner, payoff,
   ## or results.json. Preserve available failure diagnostics and trajectory
-  ## evidence, notify connected players so they exit cleanly, and exit non-zero.
+  ## evidence, notify connected players so they exit cleanly, write the
+  ## Coworld GamePlayerFailure wire artifact when configured, and exit non-zero.
   withLock stateLock:
     if state.finished:
       return
@@ -308,6 +317,17 @@ proc failEpisode(runtimeConfig: RuntimeConfig, failureKind, reason: string,
       except CatchableError as error:
         echo "garble capture: private failure artifact failed: ", error.msg
   sleep(200)
+  let failureUri = getEnv("COGAME_PLAYER_FAILURE_URI").strip()
+  let wireFailure = playerFailureJson(failureKind, reason, failedSeat)
+  if failureUri.len > 0 and wireFailure != nil:
+    try:
+      echo "garble: writing player failure artifact"
+      writeArtifact(
+        failureUri, $wireFailure, "application/json",
+        "COGAME_PLAYER_FAILURE_METHOD"
+      )
+    except CatchableError as error:
+      echo "garble: player failure artifact write failed: ", error.msg
   quit(1)
 
 const PlayBudgetFraction* = 0.6
