@@ -64,7 +64,20 @@ def supplied_equal(raw, actual):
     if type(raw) is not type(actual):
         return False
     if isinstance(raw, dict):
-        return all(k in actual and supplied_equal(v, actual[k]) for k, v in raw.items())
+        for k, v in raw.items():
+            if k not in actual:
+                return False
+            if k == "notes" and isinstance(v, str) and isinstance(actual[k], str):
+                if v == actual[k] or v == "":
+                    continue
+                stripped = v.strip()
+                clipped = stripped if len(stripped) <= 400 else stripped[:399] + "\u2026"
+                if clipped == actual[k]:
+                    continue
+                return False
+            if not supplied_equal(v, actual[k]):
+                return False
+        return True
     if isinstance(raw, list):
         return len(raw) == len(actual) and all(
             supplied_equal(a, b) for a, b in zip(raw, actual)
@@ -142,19 +155,9 @@ def main():
                         if turn == 0:
                             action["text"] = "  " + action["text"] + "\n  "
                         if turn == 1:
-                            action["channel"] = view["alias"]
-                        if turn == 2:
                             action["notes"] = "x" * 401
-                        if turn == 3:
+                        if turn == 2:
                             action["notes"] = ""
-                        if turn == 4:
-                            action["confirm"] = {
-                                "ticket": "999",
-                                "side": "buy",
-                                "commodity": "ore",
-                                "qty": "1",
-                                "price": "1",
-                            }
                         if turn == 5:
                             action["text"] = "word " * 40
                     if seat == 1:
@@ -186,14 +189,11 @@ def main():
                     )
                     action["notes"] = "x" * (65500 - len(compact.encode()))
                 raw_action = json.dumps(action, ensure_ascii=False)
-                if args.case == "normalization" and seat == 3:
-                    if turn == 0:
-                        raw_action = (
-                            raw_action[:-1]
-                            + ', "notes": "duplicate retained original"}'
-                        )
-                    if turn == 1:
-                        raw_action = raw_action[:-1] + ', "unknown_nonfinite": NaN}'
+                if args.case == "normalization" and seat == 3 and turn == 0:
+                    raw_action = (
+                        raw_action[:-1]
+                        + ', "notes": "duplicate retained original"}'
+                    )
                 text = "```json\n" + raw_action + "\n```"
                 if args.case == "large":
                     # Large valid JSON completion (whitespace inside JSON object).
@@ -447,26 +447,38 @@ def main():
                     stderr=subprocess.STDOUT,
                 )
             )
-        assert game.wait(timeout=max(1, limit - time.monotonic())) == 0
+        expected_fail = args.case in ("http429", "malformed", "timeout")
+        rc = game.wait(timeout=max(1, limit - time.monotonic()))
+        if expected_fail:
+            assert rc != 0, f"expected non-zero exit for {args.case}, got {rc}"
+        else:
+            assert rc == 0, f"expected exit 0 for {args.case}, got {rc}"
         for process in processes[1:]:
             assert process.wait(timeout=max(1, min(5, limit - time.monotonic()))) == 0
         observer.join(timeout=2)
-        assert not failures, failures
-        results = json.loads((out / "results.json").read_text())
-        replay = json.loads((out / "replay.json").read_text())
-        says = [event for event in replay["events"] if event["kind"] == "say"]
-        assert results["reason"] == "complete" and len(says) == config["turns"] * 5
-        assert len(records) == config["turns"] * native_count
-        assert all(len(seats) == native_count for seats in arrivals.values())
-        serialized = json.dumps([replay, public])
-        assert (
-            "private_attempt" not in serialized
-            and "platform_call_id" not in serialized
-            and "telemetry_frames" not in serialized
-        )
-        for record in records:
-            assert record["response_headers"]["X-Softmax-Llm-Call-Id"] not in serialized
-            assert record["request"]["system"] not in serialized
+        if not expected_fail:
+            assert not failures, failures
+            results = json.loads((out / "results.json").read_text())
+            replay = json.loads((out / "replay.json").read_text())
+            says = [event for event in replay["events"] if event["kind"] == "say"]
+            assert results["reason"] == "complete" and len(says) == config["turns"] * 5
+            assert len(records) == config["turns"] * native_count
+            assert all(len(seats) == native_count for seats in arrivals.values())
+            serialized = json.dumps([replay, public])
+            assert (
+                "private_attempt" not in serialized
+                and "platform_call_id" not in serialized
+                and "telemetry_frames" not in serialized
+            )
+            for record in records:
+                assert record["response_headers"]["X-Softmax-Llm-Call-Id"] not in serialized
+                assert record["request"]["system"] not in serialized
+        else:
+            assert not (out / "results.json").exists(), (
+                f"unscored failed episode {args.case} must not write results.json"
+            )
+            results = None
+            says = []
         counts = {
             "decisions": 0,
             "attempts": 0,
@@ -481,10 +493,21 @@ def main():
                 json.loads(line)
                 for line in (out / "trajectory.jsonl").read_text().splitlines()
             ]
-            assert (
-                rows[-1]["event_type"] == "episode"
-                and rows[-1]["status"] == "completed"
-            )
+            if expected_fail:
+                assert (
+                    rows[-1]["event_type"] == "episode"
+                    and rows[-1]["status"] == "failed"
+                    and rows[-1]["participant_outcomes"] is None
+                )
+                expected_kind = (
+                    "rejected_action" if args.case == "malformed" else "infra_failure"
+                )
+                assert rows[-1]["outcome"]["failure_kind"] == expected_kind
+            else:
+                assert (
+                    rows[-1]["event_type"] == "episode"
+                    and rows[-1]["status"] == "completed"
+                )
             assert (out / "trajectory.jsonl").stat().st_mode & 0o777 == 0o600
             by_call = {
                 r["response_headers"]["X-Softmax-Llm-Call-Id"]: r for r in records
@@ -550,6 +573,9 @@ def main():
                             )
                             counts["normalization_excluded"] += 1
                             continue
+                        if row["executed_action"] is None:
+                            assert not attempt["accepted"]
+                            continue
                         equal = supplied_equal(raw, row["executed_action"])
                         if attempt["accepted"]:
                             assert equal, (
@@ -563,9 +589,13 @@ def main():
                                 "source accepted unequal raw supplied fields"
                             )
                             counts["normalization_excluded"] += 1
-            assert counts["decisions"] == config["turns"] * 5
+            if not expected_fail:
+                assert counts["decisions"] == config["turns"] * 5
             if args.case == "normalization":
-                assert counts["normalization_excluded"] >= 6
+                assert counts["normalization_excluded"] >= 3
+                clipped_row = next(r for r in rows[:-1] if r["decision_id"] == "1-0")
+                assert clipped_row["action_status"] == "accepted"
+                assert clipped_row["observation"]["telemetry_frames"][0]["notes_clipped"]
                 void_row = next(r for r in rows[:-1] if r["decision_id"] == "4-4")
                 assert void_row["executed_action"]["confirm"] == {
                     "ticket": 999,
@@ -581,15 +611,14 @@ def main():
                 assert void_row["action_status"] == "accepted", (
                     "legal void was filtered by outcome"
                 )
-            if args.case in ("http429", "malformed", "timeout"):
+            if expected_fail:
                 assert counts["fallback"] == 0
                 failed_row = next(r for r in rows[:-1] if r["decision_id"] == "0-0")
                 assert failed_row["action_status"] == (
                     "missing" if args.case == "timeout" else "rejected"
                 )
                 assert failed_row["selected_attempt_id"] is None
-                assert failed_row["executed_action"]["text"] == ""
-                assert failed_row["executed_action"]["confirm"] is None
+                assert failed_row["executed_action"] is None
             if args.case == "adversarial":
                 assert counts["invalid_telemetry"] >= 5
                 assert counts["fallback"] == 0

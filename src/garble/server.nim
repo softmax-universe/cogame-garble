@@ -50,6 +50,7 @@ type
     pendingDecisions: Table[int, Decision]
     pendingSources: Table[int, string]
     pendingFailed: Table[int, string]
+    pendingFailureKinds: Table[int, string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -270,6 +271,45 @@ proc finishEpisode(runtimeConfig: RuntimeConfig) =
   echo "garble: episode complete, shutting down"
   quit(0)
 
+proc failEpisode(runtimeConfig: RuntimeConfig, failureKind, reason: string,
+    failedSeat = -1) =
+  ## Terminate an unfinished episode unscored with no invented winner, payoff,
+  ## or results.json. Preserve available failure diagnostics and trajectory
+  ## evidence, notify connected players so they exit cleanly, and exit non-zero.
+  withLock stateLock:
+    if state.finished:
+      return
+    state.finished = true
+    echo "garble: episode failed unscored [", failureKind, "] (", reason, ")"
+    var aliasNames = newJArray()
+    for name in state.sim.names:
+      aliasNames.add(%name)
+    var final = %*{
+      "type": "final",
+      "done": true,
+      "failed": true,
+      "failure_kind": failureKind,
+      "reason": reason,
+      "failed_seat": failedSeat,
+      "scores": newJNull(),
+      "portfolio": newJNull(),
+      "names": aliasNames,
+      "turns": state.sim.turnsPlayed
+    }
+    for slot, socket in state.playerSockets:
+      final["slot"] = %slot
+      try: socket.send($final)
+      except CatchableError: discard
+    state.broadcastLocked()
+    if state.capture != nil:
+      try:
+        state.capture.finishCaptureFailed(failureKind, reason, failedSeat,
+          state.sim.turn, state.sim.turnsPlayed, state.config.turns)
+      except CatchableError as error:
+        echo "garble capture: private failure artifact failed: ", error.msg
+  sleep(200)
+  quit(1)
+
 const PlayBudgetFraction* = 0.6
   ## Share of the platform's episode timeout spent playing. The rest covers
   ## container start, player connects and writing the artifacts — the part
@@ -295,11 +335,23 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         break
       sleep(200)
 
+    var connectedCount = 0
     withLock stateLock:
+      connectedCount = state.playerSockets.len
       state.started = true
-      echo "garble: starting with ", state.playerSockets.len, "/",
+      echo "garble: starting with ", connectedCount, "/",
         config.tokens.len, " players connected"
       state.broadcastLocked()
+    if connectedCount < config.tokens.len:
+      var missingSeat = -1
+      withLock stateLock:
+        for seat in 0 ..< config.tokens.len:
+          if not state.playerSockets.hasKey(seat):
+            missingSeat = seat
+            break
+      failEpisode(runtimeConfig, "infra_failure",
+        "player connect timeout: only " & $connectedCount & "/" &
+        $config.tokens.len & " players connected", missingSeat)
 
     ## The platform kills the episode at its timeout and keeps nothing. Play
     ## inside a fraction of it so results and the replay are written with
@@ -367,6 +419,7 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         state.pendingDecisions.clear()
         state.pendingSources.clear()
         state.pendingFailed.clear()
+        state.pendingFailureKinds.clear()
         if state.capture != nil:
           try: state.capture.beginCaptureTurn(simCopy)
           except CatchableError as error:
@@ -401,6 +454,8 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
       var wasScripted = newSeq[bool](Seats)
       var accepted = newSeq[bool](Seats)
       var failReasons = newSeq[string](Seats)
+      var failKinds = newSeq[string](Seats)
+      var firstFailedSeat = -1
       withLock stateLock:
         for seat in 0 ..< Seats:
           if state.pendingDecisions.hasKey(seat):
@@ -408,19 +463,48 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             wasScripted[seat] = state.pendingSources[seat] == "scripted"
             accepted[seat] = true
             continue
-          failReasons[seat] =
-            if state.pendingFailed.hasKey(seat):
-              state.pendingFailed[seat]
-            elif not state.playerSockets.hasKey(seat):
-              "player disconnected"
-            else:
-              "decision timeout"
-          echo "garble: seat ", seat, " forfeited turn (", failReasons[seat], ")"
-          decisions[seat] = Decision(channel: Radio)
+          if state.pendingFailed.hasKey(seat):
+            failReasons[seat] = state.pendingFailed[seat]
+            failKinds[seat] = state.pendingFailureKinds.getOrDefault(seat, "infra_failure")
+          elif not state.playerSockets.hasKey(seat):
+            failReasons[seat] = "player disconnected"
+            failKinds[seat] = "infra_failure"
+          else:
+            failReasons[seat] = "decision timeout"
+            failKinds[seat] = "infra_failure"
+          echo "garble: seat ", seat, " decision failed [", failKinds[seat],
+            "] (", failReasons[seat], ")"
+          if firstFailedSeat < 0:
+            firstFailedSeat = seat
           wasScripted[seat] = false
           accepted[seat] = false
         state.pendingTurn = -1
 
+      if firstFailedSeat >= 0:
+        withLock stateLock:
+          var failed = newSeq[bool](Seats)
+          for seat in 0 ..< Seats:
+            failed[seat] = not accepted[seat]
+          if state.capture != nil:
+            try: state.capture.appliedCaptureFailedTurn(state.sim, failed, failReasons)
+            except CatchableError as error:
+              echo "garble capture: failed turn record error: ", error.msg
+          for seat in 0 ..< Seats:
+            if state.playerSockets.hasKey(seat):
+              var resultFrame = %*{
+                "type": "decision_result", "turn": simCopy.turn,
+                "accepted": accepted[seat]
+              }
+              if not accepted[seat] and failReasons[seat].len > 0:
+                resultFrame["reason"] = %failReasons[seat]
+              try: state.playerSockets[seat].send($resultFrame)
+              except CatchableError: discard
+        failEpisode(runtimeConfig, failKinds[firstFailedSeat],
+          "seat " & $firstFailedSeat & " turn " & $simCopy.turn & ": " &
+          failReasons[firstFailedSeat], firstFailedSeat)
+
+      var applyFailedSeat = -1
+      var applyFailReason = ""
       withLock stateLock:
         ## Transmit, in seat order.
         for seat in 0 ..< Seats:
@@ -430,37 +514,51 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             state.sim.applySay(seat, decision.channel, decision.text,
               decision.notes, wasScripted[seat])
           except GarbleError as error:
-            echo "garble: transmission rejected (", error.msg,
-              "); turn forfeited"
-            state.sim.applySay(seat, Radio, "", "", false)
-            decisions[seat].hasConfirm = false
-            wasScripted[seat] = false
+            echo "garble: transmission rejected (", error.msg, ")"
             accepted[seat] = false
             failReasons[seat] = error.msg
+            applyFailedSeat = seat
+            applyFailReason = error.msg
+            break
           state.broadcastLocked()
-        ## Confirms, in seat order, after every transmission has landed.
-        for seat in 0 ..< Seats:
-          let decision = decisions[seat]
-          if not decision.hasConfirm:
-            continue
-          try:
-            state.sim.applyConfirm(seat, decision.ticket, decision.side,
-              decision.qty, decision.commodity, decision.price,
-              wasScripted[seat])
-          except GarbleError as error:
-            ## An inadmissible confirm is a legal move that voids; only a
-            ## malformed one lands here, and it costs the seat its confirm.
-            echo "garble: confirm rejected (", error.msg, ")"
-          state.broadcastLocked()
-        if state.capture != nil:
+        if applyFailedSeat < 0:
+          ## Confirms, in seat order, after every transmission has landed.
+          for seat in 0 ..< Seats:
+            let decision = decisions[seat]
+            if not decision.hasConfirm:
+              continue
+            try:
+              state.sim.applyConfirm(seat, decision.ticket, decision.side,
+                decision.qty, decision.commodity, decision.price,
+                wasScripted[seat])
+            except GarbleError as error:
+              ## An inadmissible confirm is a legal move that voids; only a
+              ## malformed one lands here.
+              echo "garble: confirm rejected (", error.msg, ")"
+              accepted[seat] = false
+              failReasons[seat] = error.msg
+              applyFailedSeat = seat
+              applyFailReason = error.msg
+              break
+            state.broadcastLocked()
+        if applyFailedSeat >= 0:
           var failed = newSeq[bool](Seats)
           for seat in 0 ..< Seats:
             failed[seat] = not accepted[seat]
-          try: state.capture.appliedCaptureTurn(state.sim, failed)
-          except CatchableError as error:
-            echo "garble capture: applied turn failed: ", error.msg
-        state.sim.endTurn()
-        state.broadcastLocked()
+          if state.capture != nil:
+            try: state.capture.appliedCaptureFailedTurn(state.sim, failed, failReasons)
+            except CatchableError as error:
+              echo "garble capture: failed turn record error: ", error.msg
+        else:
+          if state.capture != nil:
+            var failed = newSeq[bool](Seats)
+            for seat in 0 ..< Seats:
+              failed[seat] = not accepted[seat]
+            try: state.capture.appliedCaptureTurn(state.sim, failed)
+            except CatchableError as error:
+              echo "garble capture: applied turn failed: ", error.msg
+          state.sim.endTurn()
+          state.broadcastLocked()
         for seat in 0 ..< Seats:
           if state.playerSockets.hasKey(seat):
             var resultFrame = %*{
@@ -469,7 +567,12 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             }
             if not accepted[seat] and failReasons[seat].len > 0:
               resultFrame["reason"] = %failReasons[seat]
-            state.playerSockets[seat].send($resultFrame)
+            try: state.playerSockets[seat].send($resultFrame)
+            except CatchableError: discard
+      if applyFailedSeat >= 0:
+        failEpisode(runtimeConfig, "rejected_action",
+          "seat " & $applyFailedSeat & " turn " & $simCopy.turn & ": " &
+          applyFailReason, applyFailedSeat)
 
       ## Pace so a spectator can read the turn that just landed.
       if config.turnDelayMs > 0:
@@ -480,25 +583,16 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
     finishEpisode(runtimeConfig)
 
 proc runGame(runtimeConfig: RuntimeConfig) {.gcsafe.} =
-  ## The game thread is the only thing that ever writes an artifact, and the
-  ## HTTP thread serves /healthz forever, so a thread that dies mid-episode
-  ## would leave a container that looks alive and writes NOTHING until the
-  ## platform kills it. A short scored episode always beats a silent death:
-  ## log, settle what was played, and write it.
   {.gcsafe.}:
     try:
       playEpisode(runtimeConfig)
     except CatchableError as error:
       echo "garble: the game thread failed (", error.msg,
-        "); settling what was played"
+        "); terminating episode unscored"
       try:
-        withLock stateLock:
-          if not state.sim.done:
-            state.sim.endEarly()
-            state.broadcastLocked()
-        finishEpisode(runtimeConfig)
+        failEpisode(runtimeConfig, "infra_failure", "game error: " & error.msg)
       except CatchableError as inner:
-        echo "garble: could not write the artifacts: ", inner.msg
+        echo "garble: could not record episode failure: ", inner.msg
         quit(1)
 
 var gameThread: Thread[RuntimeConfig]
@@ -637,6 +731,10 @@ proc websocketHandler(
               if available:
                 state.pendingFailed[slot] =
                   payload{"reason"}.getStr("player decision failed")
+                let fk = payload{"failure_kind"}.getStr("infra_failure")
+                state.pendingFailureKinds[slot] =
+                  if fk in ["infra_failure", "rejected_action"]: fk
+                  else: "infra_failure"
             elif kind == "decision":
               try:
                 let action = payload["action"]
@@ -657,6 +755,7 @@ proc websocketHandler(
               except CatchableError as error:
                 if available:
                   state.pendingFailed[slot] = error.msg
+                  state.pendingFailureKinds[slot] = "rejected_action"
                 if state.capture != nil:
                   try: state.capture.rejectedFrame(turn, slot, captureIndex, "native action rejected: " & error.msg)
                   except CatchableError: discard
@@ -727,6 +826,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.pendingDecisions = initTable[int, Decision]()
   state.pendingSources = initTable[int, string]()
   state.pendingFailed = initTable[int, string]()
+  state.pendingFailureKinds = initTable[int, string]()
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)

@@ -39,8 +39,8 @@ An ordinary player with canned and trained-adapter backends is in
 [`players/ordinary/`](players/ordinary/README.md).
 Two built-in **scripted baselines** — `quoter`, the honest repeater, and
 `shark`, the terse opportunist — submit their own actions from the player
-process. Missing or invalid actions are rejected and forfeit the seat's turn
-(no transmission or confirm, no fallback move).
+process. Missing, timed-out, failed, or invalid actions terminate the
+unfinished episode unscored with no substituted move or invented forfeit.
 
 Seats play under **anonymous cog aliases** (Sprocket, Gizmo, …): policy
 display names never reach the agents' prompts. The spectator and replay
@@ -111,7 +111,7 @@ nim c -d:release -o:bin/garble src/garble.nim
 nim c -d:release -o:bin/garble-player src/garble_player.nim
 nim c --hints:off -d:emscripten replay-viewer/garble_replay.nim  # wasm viewer
 # Set a player-owned Claude credential for model play. Without one the prompt
-# player is disabled and forfeits its turns without substituting a scripted move.
+# player is disabled and reports a decision failure without substituting a scripted move.
 ```
 
 Coworld packaging (from a metta checkout):
@@ -122,18 +122,20 @@ uv run coworld certify <this dir>/dist/coworld_manifest.json
 uv run coworld upload-coworld <this dir>/dist/coworld_manifest.json
 ```
 
-The certification fixture starts with scripted Quoter so the platform's legacy
-release smoke games use a deterministic player without model calls. The mixed
-certificate still includes three native prompt players, one Quoter and one Shark
-for eight turns. Ordinary Standard games remain twelve turns; certification does
-not replace complete real-model episode validation.
+The certification fixture runs purely scripted seats (`garble-quoter` and
+`garble-shark`) for eight turns so offline certification is deterministic
+without model calls. The manifest lists `garble-player` first as the native
+model player with `COWORLD_LLM_ENABLED=true` and `anthropic/claude-haiku-4.5`,
+with `garble-quoter` and `garble-shark` as explicit separate scripted IDs.
+Ordinary Standard games remain twelve turns; certification does not replace
+complete real-model episode validation.
 
 The bundled prompt player opts into metered hosted inference with
 `COWORLD_LLM_ENABLED=true` and the explicit model
 `anthropic/claude-haiku-4.5`. Quoter and Shark do not enable inference.
 Custom prompt policies also need the `--use-llm` option below; without hosted
 inference or local provider credentials, the prompt player is disabled and
-forfeits its turns rather than falling back to Quoter.
+terminates the episode unscored rather than falling back to Quoter.
 
 ## Fielding a policy
 

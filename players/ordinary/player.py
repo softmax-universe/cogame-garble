@@ -178,6 +178,7 @@ def main() -> None:
                         {
                             "type": "decision_failed",
                             "turn": frame["turn"],
+                            "failure_kind": "rejected_action",
                             "reason": str(exc),
                         }
                     )
@@ -207,6 +208,8 @@ def main() -> None:
                     turn["prompt_selection"],
                 )
         elif kind == "final":
+            if frame.get("failed") or frame.get("scores") is None:
+                break
             if pending:
                 raise RuntimeError("Garble ended with unacknowledged decisions")
             if artifact:

@@ -1,6 +1,6 @@
 ## Optional private telemetry. Socket identity and the native sim own execution;
 ## caller metadata is untrusted until an external authenticated receipt audit.
-import std/[base64, json, math, options, os, parsejson, streams, strutils, tables]
+import std/[base64, json, math, options, os, parsejson, streams, strutils, tables, unicode]
 import crunchy, curly
 import bitworld/runtime
 import ./decision_trajectory, ./sim
@@ -72,13 +72,39 @@ proc safeDiagnostic*(detail: string): string =
   if scalarUtf8(detail): detail
   else: "non-Unicode diagnostic bytes, base64=" & encode(detail)
 
-proc strictRawObject(text: string): JsonNode =
-  ## Independent admission parser: the gameplay decoder remains unchanged.
+proc unwrapOuterFence(text: string): string =
+  var cleaned = text
+  if cleaned.startsWith("\xEF\xBB\xBF"):
+    cleaned = cleaned[3 .. ^1]
+  cleaned = cleaned.strip()
+  if not cleaned.startsWith("```"):
+    return cleaned
+  let newlineIdx = cleaned.find('\n')
+  if newlineIdx < 0:
+    raise newException(ValueError, "unclosed markdown code fence")
+  let tag = cleaned[3 ..< newlineIdx].strip().toLowerAscii()
+  if tag.len > 0 and tag != "json":
+    raise newException(ValueError, "unsupported markdown code fence language: " & tag)
+  let rest = cleaned[newlineIdx + 1 .. ^1]
+  if not rest.endsWith("```"):
+    raise newException(ValueError, "unclosed markdown code fence")
+  let beforeClose = rest[0 ..< rest.len - 3]
+  if beforeClose.len > 0:
+    let lastNewline = beforeClose.rfind('\n')
+    let indent =
+      if lastNewline < 0: beforeClose
+      else: beforeClose[lastNewline + 1 .. ^1]
+    if indent.strip(chars = {' ', '\t', '\r'}).len > 0:
+      raise newException(ValueError, "closing markdown fence must be on its own line")
+  beforeClose.strip()
+
+proc strictRawObject*(text: string): JsonNode =
+  ## Independent admission parser: accepts bare JSON or a single ordinary outer
+  ## Markdown code fence, enforcing strict RFC 8259 JSON without silent repair.
   if not scalarUtf8(text): raise newException(ValueError, "raw JSON is not UTF-8")
-  let first = text.find('{')
-  let last = text.rfind('}')
-  if first < 0 or last < first: raise newException(ValueError, "no raw JSON object")
-  let source = text[first .. last]
+  let source = unwrapOuterFence(text)
+  if source.len == 0 or source[0] != '{' or source[^1] != '}':
+    raise newException(ValueError, "one raw JSON object required")
   var quoted = false
   var index = 0
   while index < source.len:
@@ -182,6 +208,12 @@ proc strictRawObject(text: string): JsonNode =
   if parser.tok != tkEof or result.kind != JObject:
     raise newException(ValueError, "one raw JSON object required")
 
+proc clipMemoryRunes(text: string, limit: int): string =
+  result = text.strip()
+  if result.runeLen <= limit:
+    return
+  result = result.runeSubStr(0, limit - 1) & "\u2026"
+
 proc suppliedFieldsEqual(raw, actual: JsonNode): bool =
   if raw == nil or actual == nil or raw.kind != actual.kind: return false
   if raw.kind == JObject:
@@ -194,6 +226,36 @@ proc suppliedFieldsEqual(raw, actual: JsonNode): bool =
       if not suppliedFieldsEqual(raw[index], actual[index]): return false
     return true
   raw == actual
+
+proc suppliedActionMatches*(raw, actual: JsonNode, notesClipped: var bool,
+    notesPriorRetained: var bool): bool =
+  ## Game action fields (channel, text, confirm) must match strictly without
+  ## silent trimming or repair. Ancillary private `notes` memory may be clipped
+  ## at MaxNotesRunes (400 runes) or leave prior memory intact when empty.
+  notesClipped = false
+  notesPriorRetained = false
+  if raw == nil or actual == nil or raw.kind != JObject or actual.kind != JObject:
+    return false
+  for key, value in raw:
+    if not actual.hasKey(key):
+      return false
+    if key == "notes":
+      if value.kind != JString or actual[key].kind != JString:
+        return false
+      let rawNotes = value.getStr()
+      let actualNotes = actual[key].getStr()
+      if rawNotes == actualNotes:
+        continue
+      if rawNotes.len == 0:
+        notesPriorRetained = actualNotes.len > 0
+        continue
+      if clipMemoryRunes(rawNotes, MaxNotesRunes) == actualNotes:
+        notesClipped = true
+        continue
+      return false
+    elif not suppliedFieldsEqual(value, actual[key]):
+      return false
+  true
 
 proc physicalSetup*(sim: Sim): JsonNode =
   ## Delivery noise has its own seed-derived stream, beyond the visible paths.
@@ -376,7 +438,7 @@ proc appliedCaptureTurn*(capture: RuntimeCapture, sim: Sim,
     let decision = capture.turns[sim.turn][seat]
     decision.failed = failed[seat]
     decision.observation["execution_origin"] = %(
-      if failed[seat]: "turn forfeited (no valid action)"
+      if failed[seat]: "turn failed (no valid action)"
       else: "installed socket action")
     var actual = %*{"channel": "RADIO", "text": "", "notes": sim.notes[seat], "confirm": nil}
     var events = newJArray()
@@ -393,43 +455,75 @@ proc appliedCaptureTurn*(capture: RuntimeCapture, sim: Sim,
     decision.actual = actual
     decision.observation["native_events"] = events
 
-proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
-  if capture == nil: return
+proc appliedCaptureFailedTurn*(capture: RuntimeCapture, sim: Sim,
+    failed: seq[bool], failReasons: seq[string]) =
+  ## Record an unapplied failed turn without fabricating any executed action.
+  if capture == nil or not capture.turns.hasKey(sim.turn): return
+  for seat in 0 ..< Seats:
+    let decision = capture.turns[sim.turn][seat]
+    decision.failed = true
+    decision.actual = newJNull()
+    decision.observation["execution_origin"] = %(
+      if failed[seat]: "episode terminated unscored: " & failReasons[seat]
+      else: "turn unapplied (episode terminated unscored)")
+    if failed[seat] and failReasons[seat].len > 0:
+      decision.observation["failure_reason"] = %failReasons[seat]
+    decision.observation["native_events"] = newJArray()
+
+proc recordCapturedTurns(capture: RuntimeCapture) =
   for turn in 0 ..< MaxCaptureTurns:
     if not capture.turns.hasKey(turn): continue
     for seat, decision in capture.turns[turn]:
-      if decision.actual.kind == JNull: continue # interrupted open turn is a gap
+      if decision.actual.kind == JNull and not decision.failed:
+        continue # interrupted open turn without failure record
       var attempts: seq[DecisionAttempt]
       var selected = none(string)
       var status = asRejected
       for index, frame in decision.frames:
-        decision.observation["telemetry_frames"].add(frame.diagnostic)
-        if frame.attempt.isNone: continue
+        if frame.attempt.isNone:
+          decision.observation["telemetry_frames"].add(frame.diagnostic)
+          continue
         var attempt = frame.attempt.get()
         attempt.accepted = false
         if index == decision.selected and not decision.failed and
             attempt.origin == aoModel and attempt.responseComplete == some(true) and
-            attempt.httpStatus == some(200) and attempt.response.kind == JString and
-            attempt.platformCallId.isSome:
+            attempt.httpStatus == some(200) and attempt.response.kind == JString:
           try:
             let raw = strictRawObject(attempt.response.getStr())
-            if not suppliedFieldsEqual(raw, decision.actual):
+            var notesClipped = false
+            var notesPriorRetained = false
+            if not suppliedActionMatches(raw, decision.actual, notesClipped, notesPriorRetained):
               raise newException(ValueError, "raw supplied action fields/types differ from native applied action")
             if not frame.diagnostic.hasKey("raw_proposal") or raw != frame.diagnostic["raw_proposal"]:
               raise newException(ValueError, "raw model object differs from supplied socket action")
+            if notesClipped:
+              frame.diagnostic["notes_clipped"] = %true
+              frame.diagnostic["raw_notes_runes"] = %raw["notes"].getStr().runeLen
+              frame.diagnostic["stored_notes_runes"] = %decision.actual["notes"].getStr().runeLen
+            if notesPriorRetained:
+              frame.diagnostic["notes_retained_prior"] = %true
             attempt.accepted = true
-            # Installed defaults are canonicalized only after all supplied raw
-            # fields passed strict equality. The original text stays untouched.
+            # Installed defaults and clipped ancillary memory are canonicalized
+            # only after all supplied game action fields passed strict equality.
+            # The original raw model text in attempt.response stays untouched.
             attempt.parsedAction = copy(decision.actual)
           except CatchableError as error:
             attempt.rejectionReason = some(safeDiagnostic(error.msg))
+        decision.observation["telemetry_frames"].add(frame.diagnostic)
         if attempt.accepted:
           selected = some(attempt.attemptId)
           status = asAccepted
         attempts.add(attempt)
       if decision.failed:
         selected = none(string)
-        status = if attempts.len > 0: asRejected else: asMissing
+        var hasResponseOrProposal = false
+        for att in attempts:
+          if att.responseComplete == some(true) or att.response.kind != JNull:
+            hasResponseOrProposal = true
+        for frame in decision.frames:
+          if frame.diagnostic.hasKey("raw_proposal"):
+            hasResponseOrProposal = true
+        status = if hasResponseOrProposal: asRejected else: asMissing
       decision.observation["strict_raw_fields_enforced"] = %true
       decision.observation["authenticated_receipt_audit_required"] = %true
       var observation = decision.observation
@@ -453,6 +547,10 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
         if capture.errors.len < 16: capture.errors.add(detail)
       capture.trajectory.recordDecision($turn & "-" & $seat, $seat,
         observation, attempts, selected, actual, status)
+
+proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
+  if capture == nil: return
+  capture.recordCapturedTurns()
   var privateOutcome = copy(outcome)
   var scores = outcome{"scores"}
   if not scalarJson(outcome):
@@ -464,6 +562,26 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
   capture.trajectory.finish(if capture.failed: esFailed
     elif outcome{"reason"}.getStr() == "complete": esCompleted else: esTruncated,
     privateOutcome, scores)
+  capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
+
+proc finishCaptureFailed*(capture: RuntimeCapture, failureKind, reason: string,
+    failedSeat, turn, turnsPlayed, maxTurns: int) =
+  ## Finish an aborted/unscored episode with no numeric scores or invented payoff.
+  if capture == nil: return
+  capture.failed = true
+  capture.recordCapturedTurns()
+  var privateOutcome = %*{
+    "status": "failed",
+    "failure_kind": safeDiagnostic(failureKind),
+    "reason": safeDiagnostic(reason),
+    "failed_seat": failedSeat,
+    "turn": turn,
+    "turns": turnsPlayed,
+    "maxTurns": maxTurns
+  }
+  if capture.errors.len > 0:
+    privateOutcome["capture_errors"] = %capture.errors
+  capture.trajectory.finish(esFailed, privateOutcome, newJNull())
   capture.trajectory.writeEventsToUri(getEnv(CogameSaveTrajectoryUriEnv))
 
 proc requestAttempt*(body: string): DecisionAttempt =
