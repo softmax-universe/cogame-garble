@@ -233,7 +233,13 @@ def main() -> None:
             assert len(row["executed_action"]["notes"]) == 400
     print("PASS 1/5: Nov 25 exact 8 turns (fenced, confirm:null, clipped notes, no call_id)")
 
-    # 2. Regular JSON + omitted optional defaults + single outer fence
+    # 2. Regular JSON + omitted optional defaults + closed and optionally closed final fences
+    masked_final_fence = '```json\n{"text":"SELL 5 ORE AT 12","confirm":null}'
+    reasoned_masked_fence = (
+        'Checking prices first.\n```json\n'
+        '{"channel":"RADIO","text":"SELL 5 ORE AT 12","confirm":null}'
+    )
+
     def regular_and_defaults(view):
         t = view["turn"]
         if t == 0:
@@ -242,23 +248,35 @@ def main() -> None:
             return 200, json.dumps({"channel": "RADIO", "text": "SELL 5 ORE AT 12", "confirm": None})
         if t == 2:
             return 200, '```\n{"text":"BUY 3 TIN AT 10","confirm":null}\n```'
+        if t == 3:
+            return 200, masked_final_fence
+        if t == 4:
+            return 200, reasoned_masked_fence
         return 200, json.dumps(
             {"channel": "RADIO", "text": "SELL 5 ORE AT 12", "notes": "", "confirm": None}
         )
 
     rc, out = run_episode(game_bin, player_bin, "regular-defaults", regular_and_defaults, turns=6, seed=11)
     assert rc == 0, f"regular-defaults failed: {(out / 'game.log').read_text()}"
+    assert not (out / "player_failure.json").exists()
     rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
     assert rows[-1]["status"] == "completed"
-    for row in (r for r in rows[:-1] if r["seat"] == "0"):
+    s0_reg = [r for r in rows[:-1] if r["seat"] == "0"]
+    assert len(s0_reg) == 6
+    for row in s0_reg:
         assert row["action_status"] == "accepted"
-    print("PASS 2/5: Regular JSON, omitted optional defaults, confirm:null, plain fence")
+        assert row["attempts"][0]["accepted"] is True
+    assert s0_reg[3]["attempts"][0]["response"] == masked_final_fence
+    assert s0_reg[4]["attempts"][0]["response"] == reasoned_masked_fence
+    print("PASS 2/5: Regular JSON, omitted defaults, closed/unclosed final fences, and Python parity")
 
-    # 3. Invalid / ambiguous JSON objects -> unscored termination, no results.json
+    # 3. Invalid / ambiguous / incomplete JSON objects -> unscored termination, no results.json
     for label, bad_text in [
         ("ambiguous-two-objects", '{"text":"SELL 5 ORE AT 12"}{"text":"BUY 5 ORE AT 10"}'),
         ("prose-wrapped", 'Here is my move: {"text":"SELL 5 ORE AT 12"}'),
         ("invalid-channel", '{"channel":"Nobody","text":"SELL 5 ORE AT 12"}'),
+        ("unclosed-incomplete-json", '```json\n{"text":"SELL 5 ORE AT 12"'),
+        ("competing-unclosed-fence", '```json\n{"text":"SELL 5 ORE AT 12"}\n{"text":"BUY 5 TIN AT 10"}'),
     ]:
         rc, out = run_episode(game_bin, player_bin, label, lambda _v, t=bad_text: (200, t), turns=6, seed=11)
         assert rc != 0, f"{label} unexpectedly succeeded"
@@ -275,9 +293,9 @@ def main() -> None:
         assert rows[-1]["outcome"]["failure_kind"] == "rejected_action"
         s0_t0 = next(r for r in rows[:-1] if r["decision_id"] == "0-0")
         assert s0_t0["action_status"] == "rejected" and s0_t0["executed_action"] is None
-    print("PASS 3/5: Invalid/ambiguous objects terminate unscored with rejected_action and GamePlayerFailure")
+    print("PASS 3/5: Invalid/incomplete/competing objects terminate unscored with rejected_action and GamePlayerFailure")
 
-    # 4. Provider / infra failures (HTTP 429, Bedrock 403 without fallback, and no-credentials)
+    # 4. Provider / infra failures (HTTP 429, HTTP 503, Bedrock 403 without fallback, and no-credentials)
     def assert_inconclusive_wire(out_dir: Path, label: str) -> None:
         pf_path = out_dir / "player_failure.json"
         assert pf_path.exists(), f"{label} did not write player_failure.json"
@@ -286,12 +304,16 @@ def main() -> None:
         assert pf["kind"] == "episode_inconclusive", f"{label}: unexpected kind {pf}"
         assert isinstance(pf["message"], str) and pf["message"], f"{label}: empty message {pf}"
 
-    rc, out = run_episode(game_bin, player_bin, "http429", lambda _v: (429, "rate limit"), turns=6, seed=11)
-    assert rc != 0 and not (out / "results.json").exists()
-    assert_inconclusive_wire(out, "http429")
-    rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
-    assert rows[-1]["status"] == "failed" and rows[-1]["participant_outcomes"] is None
-    assert rows[-1]["outcome"]["failure_kind"] == "infra_failure"
+    for label, status_code, err_text in [
+        ("http429", 429, "rate limit"),
+        ("http503", 503, "service unavailable"),
+    ]:
+        rc, out = run_episode(game_bin, player_bin, label, lambda _v, c=status_code, e=err_text: (c, e), turns=6, seed=11)
+        assert rc != 0 and not (out / "results.json").exists()
+        assert_inconclusive_wire(out, label)
+        rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
+        assert rows[-1]["status"] == "failed" and rows[-1]["participant_outcomes"] is None
+        assert rows[-1]["outcome"]["failure_kind"] == "infra_failure"
 
     # Also verify HTTP POST artifact upload via COGAME_PLAYER_FAILURE_METHOD=POST
     posted_failures: list[tuple[str, dict]] = []

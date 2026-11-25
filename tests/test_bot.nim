@@ -216,9 +216,15 @@ suite "reply parsing":
     check d2.notes == "ok {still inside}"
 
     check "final JSON block" in ActionReplyInstruction
-    let finalBlock = "My stock covers this sale.\n```json\n{\"text\":\"a\"}\n```"
-    check extractJsonObject(finalBlock)["text"].getStr == "a"
-    check strictRawObject(finalBlock) == extractJsonObject(finalBlock)
+    for candidate in [
+      "My stock covers this sale.\n```json\n{\"text\":\"a\"}\n```",
+      "```json\n{\"text\":\"a\"}",
+      "```\n{\"text\":\"a\"}",
+      "My stock covers this sale.\n```json\n{\"text\":\"a\"}",
+      "My stock covers this sale.\n```\n{\"text\":\"a\"}\n"
+    ]:
+      check extractJsonObject(candidate)["text"].getStr == "a"
+      check strictRawObject(candidate) == extractJsonObject(candidate)
 
   test "extractJsonObject rejects surrounding prose, extra objects, and bad fences":
     for bad in [
@@ -234,9 +240,16 @@ suite "reply parsing":
       """{"text":"a"}{"text":"b"}""",
       "```json\n{\"text\":\"a\"}\n```\nExtra note after fence.",
       "```json\n{\"text\":\"a\"}\n{\"text\":\"b\"}\n```",
+      "```json\n{\"text\":\"a\"}\n{\"text\":\"b\"}",
       "```json\n{\"text\":\"a\"}\n```\n```json\n{\"text\":\"b\"}\n```",
+      "My plan.\n```json\n{\"text\":\"a\"}\n```\n```json\n{\"text\":\"b\"}",
       "```python\n{\"text\":\"a\"}\n```",
-      "```json\n{\"text\":\"a\"}"
+      "```python\n{\"text\":\"a\"}",
+      "```json",
+      "```json\n",
+      "```json\n{\"text\":\"a\"",
+      "```json\n{\"text\":\"a\",\"confirm\":{\"ticket\":1}",
+      "My plan.\n```json\n{\"text\":\"a\""
     ]:
       expect GarbleError:
         discard extractJsonObject(bad)

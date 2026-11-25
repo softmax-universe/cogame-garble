@@ -90,7 +90,7 @@ proc unwrapOuterFence(text: string): string =
     raise newException(ValueError, "unsupported markdown code fence language: " & tag)
   let rest = cleaned[newlineIdx + 1 .. ^1]
   if not rest.endsWith("```"):
-    raise newException(ValueError, "unclosed markdown code fence")
+    return rest.strip()
   let beforeClose = rest[0 ..< rest.len - 3]
   if beforeClose.len > 0:
     let lastNewline = beforeClose.rfind('\n')
@@ -102,8 +102,8 @@ proc unwrapOuterFence(text: string): string =
   beforeClose.strip()
 
 proc strictRawObject*(text: string): JsonNode =
-  ## Independent admission parser: accepts bare JSON or a single ordinary outer
-  ## Markdown code fence, enforcing strict RFC 8259 JSON without silent repair.
+  ## Independent admission parser: accepts bare JSON or an optionally closed
+  ## final Markdown code fence, enforcing strict RFC 8259 JSON without silent repair.
   if not scalarUtf8(text): raise newException(ValueError, "raw JSON is not UTF-8")
   let source = unwrapOuterFence(text)
   if source.len == 0 or source[0] != '{' or source[^1] != '}':

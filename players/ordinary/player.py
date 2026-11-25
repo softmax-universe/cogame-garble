@@ -95,7 +95,7 @@ def baseline_action(view: dict, shark: bool) -> dict:
 
 
 def extract_json_object(text: str) -> dict:
-    """Parse one JSON object, bare or inside a designated final Markdown code fence."""
+    """Parse one JSON object, bare or inside an optionally closed final Markdown code fence."""
     cleaned = text.removeprefix("\ufeff").strip()
     if not cleaned:
         raise ValueError("empty Garble model response")
@@ -112,15 +112,20 @@ def extract_json_object(text: str) -> dict:
         if tag not in ("", "json"):
             raise ValueError(f"unsupported markdown code fence language: {tag}")
         rest = cleaned[newline + 1 :]
-        if not rest.endswith("```"):
-            raise ValueError("unclosed markdown code fence")
-        before_close = rest[:-3]
-        if before_close:
-            last_newline = before_close.rfind("\n")
-            indent = before_close if last_newline < 0 else before_close[last_newline + 1 :]
-            if indent.strip(" \t\r"):
-                raise ValueError("closing markdown fence must be on its own line")
-        body = before_close.strip()
+        if rest.endswith("```"):
+            before_close = rest[:-3]
+            if before_close:
+                last_newline = before_close.rfind("\n")
+                indent = (
+                    before_close
+                    if last_newline < 0
+                    else before_close[last_newline + 1 :]
+                )
+                if indent.strip(" \t\r"):
+                    raise ValueError("closing markdown fence must be on its own line")
+            body = before_close.strip()
+        else:
+            body = rest.strip()
     action = json.loads(body)
     if not isinstance(action, dict):
         raise ValueError("trained Garble decision must be a JSON object")
