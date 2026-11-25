@@ -215,8 +215,10 @@ suite "reply parsing":
     check d2.text == "BUY 3 TIN AT 20"
     check d2.notes == "ok {still inside}"
 
-    check "\"ticket\":<id>" in ActionReplyInstruction
-    check "never at top level" in ActionReplyInstruction
+    check "final JSON block" in ActionReplyInstruction
+    let finalBlock = "My stock covers this sale.\n```json\n{\"text\":\"a\"}\n```"
+    check extractJsonObject(finalBlock)["text"].getStr == "a"
+    check strictRawObject(finalBlock) == extractJsonObject(finalBlock)
 
   test "extractJsonObject rejects surrounding prose, extra objects, and bad fences":
     for bad in [
@@ -231,7 +233,6 @@ suite "reply parsing":
       """{"text":"SELL 5 ORE AT 12"} trailing {not: json}""",
       """{"text":"a"}{"text":"b"}""",
       "```json\n{\"text\":\"a\"}\n```\nExtra note after fence.",
-      "Intro before fence\n```json\n{\"text\":\"a\"}\n```",
       "```json\n{\"text\":\"a\"}\n{\"text\":\"b\"}\n```",
       "```json\n{\"text\":\"a\"}\n```\n```json\n{\"text\":\"b\"}\n```",
       "```python\n{\"text\":\"a\"}\n```",

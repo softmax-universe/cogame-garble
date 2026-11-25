@@ -386,17 +386,15 @@ Rules:
 - Every settled deal is public and stamps BOTH the spoken terms and the
   confirmed terms. Everyone sees who was robbed.
 
-OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis,
-no explanation, no markdown fences, no text before or after the object. Your
-reply must begin with the character { and end with }.""")
+Put your action in a final JSON block. A bare JSON object is also accepted.""")
 
 
 const ActionReplyInstruction* =
-  "Reply with ONLY {\"channel\":\"RADIO\" or \"<cog>\",\"text\":\"...\"," &
-  "\"confirm\":null or {\"ticket\":<id>,\"side\":\"SELL\"|\"BUY\"," &
-  "\"commodity\":\"ORE\"|\"OAT\"|\"TIN\"|\"TAR\",\"qty\":<int>," &
-  "\"price\":<int>},\"notes\":\"...\"} (put ticket, side, commodity, qty, " &
-  "and price inside confirm, never at top level)."
+  "Put your action in a final JSON block, for example " &
+  "{\"channel\":\"RADIO\",\"text\":\"SELL 2 TIN AT 9\"}. " &
+  "To confirm a ticket add \"confirm\":{\"ticket\":1,\"side\":\"SELL\"," &
+  "\"commodity\":\"TIN\",\"qty\":2,\"price\":9}, using the actual ticket and terms. " &
+  "Private notes are optional."
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -406,55 +404,11 @@ proc operatorBlock(prompt: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc unwrapSingleOuterFence(text: string): string =
-  ## Accepts either bare text or text wrapped in a single ordinary outer
-  ## Markdown code fence (JSON-tagged or plain). Rejects malformed fences or
-  ## unsupported language tags.
-  if not text.startsWith("```"):
-    return text
-  let newlineIdx = text.find('\n')
-  if newlineIdx < 0:
-    raise newException(GarbleError, "unclosed markdown code fence")
-  let tag = text[3 ..< newlineIdx].strip().toLowerAscii()
-  if tag.len > 0 and tag != "json":
-    raise newException(GarbleError,
-      "unsupported markdown code fence language: " & tag)
-  let rest = text[newlineIdx + 1 .. ^1]
-  if not rest.endsWith("```"):
-    raise newException(GarbleError, "unclosed markdown code fence")
-  let beforeClose = rest[0 ..< rest.len - 3]
-  if beforeClose.len > 0:
-    let lastNewline = beforeClose.rfind('\n')
-    let indent =
-      if lastNewline < 0: beforeClose
-      else: beforeClose[lastNewline + 1 .. ^1]
-    if indent.strip(chars = {' ', '\t', '\r'}).len > 0:
-      raise newException(GarbleError, "closing markdown fence must be on its own line")
-  beforeClose.strip()
-
 proc extractJsonObject*(text: string): JsonNode =
-  ## Parses exactly one JSON object, either bare or inside a single ordinary
-  ## outer Markdown code fence (JSON-tagged or plain). Rejects surrounding
-  ## prose, extra JSON objects, and non-object JSON values.
-  var cleaned = text
-  if cleaned.startsWith("\xEF\xBB\xBF"):
-    cleaned = cleaned[3 .. ^1]
-  cleaned = cleaned.strip()
-  if cleaned.len == 0:
-    raise newException(GarbleError, "empty response")
-  let body = unwrapSingleOuterFence(cleaned)
-  var parsed: JsonNode
   try:
-    parsed = parseJson(body)
-  except JsonParsingError as error:
-    var head = cleaned
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(GarbleError, "invalid JSON object in response (" &
-      error.msg & "): " & head.replace("\n", " "))
-  if parsed.kind != JObject:
-    raise newException(GarbleError, "JSON response must be an object")
-  parsed
+    result = strictRawObject(text)
+  except ValueError as error:
+    raise newException(GarbleError, "invalid JSON object in response: " & error.msg)
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =

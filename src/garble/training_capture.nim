@@ -78,7 +78,10 @@ proc unwrapOuterFence(text: string): string =
     cleaned = cleaned[3 .. ^1]
   cleaned = cleaned.strip()
   if not cleaned.startsWith("```"):
-    return cleaned
+    let opening = cleaned.find("\n```")
+    if opening < 0 or cleaned.startsWith("{"):
+      return cleaned
+    cleaned = cleaned[opening + 1 .. ^1]
   let newlineIdx = cleaned.find('\n')
   if newlineIdx < 0:
     raise newException(ValueError, "unclosed markdown code fence")
