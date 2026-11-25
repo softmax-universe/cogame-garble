@@ -24,6 +24,7 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
+  DefaultBedrockModel = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 type
   ScriptKind* = enum
@@ -51,10 +52,9 @@ type
     apiKey: string              ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string     ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
+    bedrockModel: string        ## single explicit Bedrock model id (no fallback)
     bedrockToken: string
-    model: string               ## direct-Anthropic transport only
+    model: string               ## direct-Anthropic or sidecar model id
     maxOutputTokens: int
     disabled*: bool             ## true once credentials are known-unavailable
 
@@ -80,35 +80,16 @@ proc resolveApiKey(): string =
     echo "garble llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another.
+proc resolveBedrockModel(): string =
+  ## Single Bedrock model id: BEDROCK_MODEL when set, otherwise the default
+  ## Haiku profile. Never rotates through alternate fallback models.
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "garble llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
+    return pinned
+  DefaultBedrockModel
 
 proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+  client.bedrockEndpoint & "/model/" & client.bedrockModel & "/invoke"
 
 proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
   result = LlmClient(
@@ -132,11 +113,11 @@ proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModel = resolveBedrockModel()
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "garble llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel], ", url ", result.bedrockUrl
+      result.bedrockModel, ", url ", result.bedrockUrl
     return
   result.apiKey = resolveApiKey()
   if result.apiKey.len > 0:
@@ -509,24 +490,18 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or a GarbleError describing why there is
-  ## none. Auth failures disable the client for the rest of the episode;
-  ## model-access and throttle failures rotate the Bedrock model for the
-  ## next batch.
+  ## The text of one reply, or a GarbleError describing why there is none.
+  ## Auth failures disable the client for the rest of the episode; provider
+  ## errors fail cleanly without rotating to alternate models.
   if error.len > 0:
     raise newException(GarbleError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(GarbleError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
     raise newException(GarbleError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
     raise newException(GarbleError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
     raise newException(GarbleError, "anthropic error " & $response.code &

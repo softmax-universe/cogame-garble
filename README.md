@@ -122,13 +122,13 @@ uv run coworld certify <this dir>/dist/coworld_manifest.json
 uv run coworld upload-coworld <this dir>/dist/coworld_manifest.json
 ```
 
-The certification fixture runs purely scripted seats (`garble-quoter` and
-`garble-shark`) for eight turns so offline certification is deterministic
-without model calls. The manifest lists `garble-player` first as the native
-model player with `COWORLD_LLM_ENABLED=true` and `anthropic/claude-haiku-4.5`,
-with `garble-quoter` and `garble-shark` as explicit separate scripted IDs.
-Ordinary Standard games remain twelve turns; certification does not replace
-complete real-model episode validation.
+The manifest lists `garble-player` first as the native model player with
+`COWORLD_LLM_ENABLED=true` and `anthropic/claude-haiku-4.5`, with
+`garble-quoter` and `garble-shark` as explicit separate scripted IDs. The
+release certification fixture seats every declared player ID (`garble-player`,
+`garble-quoter`, and `garble-shark`) for eight turns. Ordinary offline scripted
+test fixtures stay separate from the real-model release certification fixture.
+Ordinary Standard games remain twelve turns.
 
 The bundled prompt player opts into metered hosted inference with
 `COWORLD_LLM_ENABLED=true` and the explicit model

@@ -515,16 +515,16 @@
         "player_id": "garble-quoter"
       },
       {
-        "player_id": "garble-quoter"
+        "player_id": "garble-player"
+      },
+      {
+        "player_id": "garble-player"
       },
       {
         "player_id": "garble-shark"
       },
       {
-        "player_id": "garble-quoter"
-      },
-      {
-        "player_id": "garble-shark"
+        "player_id": "garble-player"
       }
     ]
   },

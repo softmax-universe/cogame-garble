@@ -9,7 +9,9 @@ Covers:
    invalid channel) -> episode terminates unscored with no results.json.
 3. Provider / infra failure (HTTP 429, missing credentials / disabled LLM) ->
    episode terminates unscored with no results.json and no numeric scores.
-4. Purely scripted offline certification fixture from coworld_manifest_template.json.
+4. Manifest certification seats every declared player ID (including native
+   garble-player), while a separate offline scripted fixture completes with
+   genuine scores.
 """
 
 from __future__ import annotations
@@ -264,48 +266,92 @@ def main() -> None:
         assert s0_t0["action_status"] == "rejected" and s0_t0["executed_action"] is None
     print("PASS 3/5: Invalid/ambiguous objects terminate unscored with rejected_action")
 
-    # 4. Provider / infra failures (HTTP 429 and disabled/no-credentials) -> unscored termination
+    # 4. Provider / infra failures (HTTP 429, Bedrock 403 without fallback, and no-credentials)
     rc, out = run_episode(game_bin, player_bin, "http429", lambda _v: (429, "rate limit"), turns=6, seed=11)
     assert rc != 0 and not (out / "results.json").exists()
     rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
     assert rows[-1]["status"] == "failed" and rows[-1]["participant_outcomes"] is None
     assert rows[-1]["outcome"]["failure_kind"] == "infra_failure"
 
+    bedrock_paths: list[str] = []
+
+    class BedrockDenyHandler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            bedrock_paths.append(self.path)
+            _ = self.rfile.read(int(self.headers.get("Content-Length", "0")))
+            encoded = json.dumps({"message": "Model access is denied"}).encode()
+            self.send_response(403)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(encoded)))
+            self.end_headers()
+            self.wfile.write(encoded)
+
+        def log_message(self, *_args):
+            pass
+
+    bedrock_srv = ThreadingHTTPServer(("127.0.0.1", free_port()), BedrockDenyHandler)
+    threading.Thread(target=bedrock_srv.serve_forever, daemon=True).start()
+    try:
+        rc, out = run_episode(
+            game_bin,
+            player_bin,
+            "bedrock403",
+            None,
+            turns=6,
+            seed=11,
+            seat0_env_override={
+                "AWS_ENDPOINT_URL_BEDROCK_RUNTIME": f"http://127.0.0.1:{bedrock_srv.server_port}",
+                "AWS_BEARER_TOKEN_BEDROCK": "test-token",
+            },
+        )
+    finally:
+        bedrock_srv.shutdown()
+    assert rc != 0 and not (out / "results.json").exists()
+    rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
+    assert rows[-1]["status"] == "failed" and rows[-1]["participant_outcomes"] is None
+    assert rows[-1]["outcome"]["failure_kind"] == "infra_failure"
+    assert bedrock_paths == ["/model/us.anthropic.claude-haiku-4-5-20251001-v1:0/invoke"], (
+        f"unexpected Bedrock request paths (must not rotate fallback models): {bedrock_paths}"
+    )
+
     rc, out = run_episode(game_bin, player_bin, "no-creds", None, turns=6, seed=11, seat0_env_override={})
     assert rc != 0 and not (out / "results.json").exists()
     rows = [json.loads(l) for l in (out / "trajectory.jsonl").read_text().splitlines()]
     assert rows[-1]["status"] == "failed" and rows[-1]["participant_outcomes"] is None
     assert rows[-1]["outcome"]["failure_kind"] == "infra_failure"
-    print("PASS 4/5: Provider/infra failures terminate unscored with infra_failure and no numeric scores")
+    print("PASS 4/5: Provider/infra failures (429, Bedrock 403 no-fallback, no-creds) terminate unscored")
 
-    # 5. Purely scripted offline certification from manifest
+    # 5. Manifest certification seats every declared player ID; separate offline scripted fixture completes
     manifest = json.loads((ROOT / "coworld_manifest_template.json").read_text())
     assert manifest["player"][0]["id"] == "garble-player"
     assert manifest["player"][0]["env"].get("COWORLD_LLM_ENABLED") == "true"
+    assert manifest["player"][0]["env"].get("COWORLD_LLM_MODEL") == "anthropic/claude-haiku-4.5"
     assert "PLAYER_SCRIPTED" not in manifest["player"][0]["env"]
     players_by_id = {p["id"]: p for p in manifest["player"]}
-    cert_scripts = []
-    for entry in manifest["certification"]["players"]:
-        pid = entry["player_id"]
-        assert pid in players_by_id
-        script = players_by_id[pid].get("env", {}).get("PLAYER_SCRIPTED")
-        assert script in ("quoter", "shark"), f"certification seat {pid} is not scripted!"
-        cert_scripts.append(script)
     cert_cfg = manifest["certification"]["game_config"]
+    cert_players = manifest["certification"]["players"]
+    assert len(cert_players) == cert_cfg["num_agents"] == 5
+    seated_ids = {entry["player_id"] for entry in cert_players}
+    assert seated_ids == set(players_by_id.keys()), (
+        f"certification.players must seat every declared player ID: got {seated_ids}, declared {set(players_by_id.keys())}"
+    )
+    assert "garble-player" in seated_ids
+
+    offline_scripted_fixture = ["quoter", "quoter", "shark", "quoter", "shark"]
     rc, out = run_episode(
         game_bin,
         player_bin,
-        "offline-cert",
+        "offline-scripted",
         None,
         turns=cert_cfg["turns"],
         seed=cert_cfg["seed"],
-        all_scripted_ids=cert_scripts,
+        all_scripted_ids=offline_scripted_fixture,
     )
-    assert rc == 0, f"offline-cert failed: {(out / 'game.log').read_text()}"
+    assert rc == 0, f"offline-scripted failed: {(out / 'game.log').read_text()}"
     cert_results = json.loads((out / "results.json").read_text())
     assert cert_results["reason"] == "complete" and cert_results["turns"] == cert_cfg["turns"]
     assert len(cert_results["scores"]) == 5
-    print("PASS 5/5: Purely scripted offline certification completes with genuine scores")
+    print("PASS 5/5: Manifest seats all declared IDs (including garble-player); separate offline scripted fixture completes")
 
 
 if __name__ == "__main__":
