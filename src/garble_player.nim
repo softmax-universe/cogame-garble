@@ -4,7 +4,7 @@
 import
   std/[json, options, os, strutils],
   whisky,
-  garble/[llm, prompts, training_capture]
+  garble/[llm, prompts, sim, training_capture]
 
 const DefaultPrompt = """
 Trade toward your contract commodity and out of your surplus. Price your
@@ -58,19 +58,34 @@ when isMainModule:
                 source = "scripted"
                 scriptedDecisionFromView(view, kind)
               elif client.disabled:
-                source = "fallback"
-                scriptedDecisionFromView(view, skQuoter)
+                raise newException(GarbleError,
+                  "LLM client disabled: no model credentials or auth failed")
               else:
                 choosePromptAction(client, view, prompt,
                   max(1, payload["timeout_ms"].getInt() div 1000 - 1), slot,
                   promptSelection(payload["prompt_config"]),
                   capture)
-          except CatchableError:
+          except CatchableError as error:
+            var failureKind = "infra_failure"
             if capture != nil and capture.evidence != nil and capture.evidence.kind != JNull:
+              let att = capture.evidence{"attempt"}
+              if att != nil and att.kind == JObject and
+                  att{"http_status"}.kind == JInt and att{"http_status"}.getInt() == 200 and
+                  att{"response_complete"}.kind == JBool and att{"response_complete"}.getBool():
+                failureKind = "rejected_action"
               try:
                 socket.send($ %*{"type": "private_attempt", "turn": payload["turn"],
                   "source": source, "private_attempt": capture.evidence})
               except CatchableError: discard
+            elif "invalid JSON" in error.msg or "JSON response" in error.msg or
+                "markdown code fence" in error.msg or "closing markdown fence" in error.msg or
+                "empty response" in error.msg or "model decision must be an object" in error.msg:
+              failureKind = "rejected_action"
+            try:
+              socket.send($ %*{"type": "decision_failed", "turn": payload["turn"],
+                "failure_kind": failureKind,
+                "reason": safeDiagnostic(error.msg)})
+            except CatchableError: discard
             raise
           socket.send($decisionFrame(payload["turn"], source, action, capture))
         of "final":

@@ -113,7 +113,7 @@ if paramCount() == 3:
   capture.beginCaptureTurn(native)
   let index = capture.receivedFrame(0, 0, supplied, "received action")
   let attemptOnly = supplied{"type"}.getStr() == "private_attempt"
-  let chosen = if attemptOnly: scriptedAction(native, 0, skQuoter)
+  let chosen = if attemptOnly: Decision(channel: Radio)
     else: parseDecision(native, 0, supplied["action"])
   if not attemptOnly:
     capture.selectedFrame(0, 0, index, native.decisionJson(chosen))
@@ -123,15 +123,15 @@ if paramCount() == 3:
   for seat in 0 ..< Seats:
     let decision = decisions[seat]
     native.applySay(seat, decision.channel, decision.text, decision.notes,
-      seat != 0 or attemptOnly)
+      seat != 0)
   for seat in 0 ..< Seats:
     let decision = decisions[seat]
     if decision.hasConfirm:
       native.applyConfirm(seat, decision.ticket, decision.side, decision.qty,
-        decision.commodity, decision.price, seat != 0 or attemptOnly)
-  var fallback = newSeq[bool](Seats)
-  fallback[0] = attemptOnly
-  capture.appliedCaptureTurn(native, fallback, newSeq[bool](Seats))
+        decision.commodity, decision.price, seat != 0)
+  var failed = newSeq[bool](Seats)
+  failed[0] = attemptOnly
+  capture.appliedCaptureTurn(native, failed)
   native.endTurn()
   native.endEarly()
   capture.finishCapture(native.resultsJson())

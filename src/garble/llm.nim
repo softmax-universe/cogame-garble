@@ -7,13 +7,14 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## Without a model credential the bundled prompt player sends a quoter
-## fallback. Quoter and shark are also fieldable scripted player policies.
+## Without a model credential the bundled prompt player is disabled and fails
+## its turns rather than substituting a scripted move. Quoter and shark are
+## fieldable scripted player policies.
 
 import ./prompts
 
 import
-  std/[json, math, os, strutils, times, unicode],
+  std/[json, os, strutils, times, unicode],
   bitworld/runtime,
   curly,
   sim,
@@ -23,6 +24,7 @@ const
   AnthropicUrl = "https://api.anthropic.com/v1/messages"
   AnthropicVersion = "2023-06-01"
   BedrockAnthropicVersion = "bedrock-2023-05-31"
+  DefaultBedrockModel = "us.anthropic.claude-haiku-4-5-20251001-v1:0"
 
 type
   ScriptKind* = enum
@@ -50,20 +52,20 @@ type
     apiKey: string              ## anthropic transport
     sidecarEndpoint: string
     bedrockEndpoint: string     ## local Bedrock transport
-    bedrockModels: seq[string]  ## candidates, tried in order on denial
-    bedrockModel: int           ## index into bedrockModels
+    bedrockModel: string        ## single explicit Bedrock model id (no fallback)
     bedrockToken: string
-    model: string               ## direct-Anthropic transport only
+    model: string               ## direct-Anthropic or sidecar model id
     maxOutputTokens: int
     disabled*: bool             ## true once credentials are known-unavailable
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"quoter" play the honest
-  ## quoter, "shark" the strategic mishearer, anything else nothing.
+  ## PLAYER_SCRIPTED values: "quoter" plays the honest quoter, "shark" the
+  ## strategic mishearer, empty string or "none" selects the prompt player.
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "quoter": skQuoter
+  of "", "none": skNone
+  of "quoter": skQuoter
   of "shark": skShark
-  else: skNone
+  else: raise newException(GarbleError, "unknown PLAYER_SCRIPTED value: " & text)
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -78,35 +80,16 @@ proc resolveApiKey(): string =
     echo "garble llm: failed to fetch ANTHROPIC_API_KEY_URI: ", error.msg
     result = ""
 
-proc bedrockModelIds(): seq[string] =
-  ## Bedrock inference-profile candidates, tried in order. BEDROCK_MODEL
-  ## pins a single id; without it, fall through this list — model access is
-  ## a per-account Marketplace subscription, so an id that works in one
-  ## account 403s in another.
+proc resolveBedrockModel(): string =
+  ## Single Bedrock model id: BEDROCK_MODEL when set, otherwise the default
+  ## Haiku profile. Never rotates through alternate fallback models.
   let pinned = getEnv("BEDROCK_MODEL").strip()
   if pinned.len > 0:
-    return @[pinned]
-  ## Haiku leads: hosted Bedrock capacity is shared account-wide and the
-  ## sonnet profiles run out of daily tokens first.
-  @[
-    "us.anthropic.claude-haiku-4-5-20251001-v1:0",
-    "us.anthropic.claude-sonnet-4-6",
-    "us.anthropic.claude-sonnet-4-5-20250929-v1:0",
-  ]
-
-proc tryNextBedrockModel(client: LlmClient, why: string): bool =
-  if client.transport != ltBedrock or
-      client.bedrockModel + 1 >= client.bedrockModels.len:
-    return false
-  client.bedrockModel.inc
-  echo "garble llm: ", client.bedrockModels[client.bedrockModel - 1],
-    " unusable (", why, "); falling back to ",
-    client.bedrockModels[client.bedrockModel]
-  true
+    return pinned
+  DefaultBedrockModel
 
 proc bedrockUrl(client: LlmClient): string =
-  client.bedrockEndpoint & "/model/" &
-    client.bedrockModels[client.bedrockModel] & "/invoke"
+  client.bedrockEndpoint & "/model/" & client.bedrockModel & "/invoke"
 
 proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
   result = LlmClient(
@@ -130,11 +113,11 @@ proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
       else: "https://bedrock-runtime." & region & ".amazonaws.com"
     result.transport = ltBedrock
     result.bedrockEndpoint = endpoint.strip(chars = {'/'}, leading = false)
-    result.bedrockModels = bedrockModelIds()
+    result.bedrockModel = resolveBedrockModel()
     result.bedrockToken = bedrockToken
     result.curl = newCurly()
     echo "garble llm: bedrock transport, model ",
-      result.bedrockModels[result.bedrockModel], ", url ", result.bedrockUrl
+      result.bedrockModel, ", url ", result.bedrockUrl
     return
   result.apiKey = resolveApiKey()
   if result.apiKey.len > 0:
@@ -144,7 +127,7 @@ proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "garble llm: no LLM credentials; using scripted fallback"
+    echo "garble llm: no LLM credentials; prompt player disabled"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -403,17 +386,15 @@ Rules:
 - Every settled deal is public and stamps BOTH the spoken terms and the
   confirmed terms. Everyone sees who was robbed.
 
-OUTPUT FORMAT: reply with ONLY one JSON object, nothing else - no analysis,
-no explanation, no markdown fences, no text before or after the object. Your
-reply must begin with the character { and end with }.""")
+Put your action in a final JSON block. A bare JSON object is also accepted.""")
 
 
 const ActionReplyInstruction* =
-  "Reply with ONLY {\"channel\":\"RADIO\" or \"<cog>\",\"text\":\"...\"," &
-  "\"confirm\":null or {\"ticket\":<id>,\"side\":\"SELL\"|\"BUY\"," &
-  "\"commodity\":\"ORE\"|\"OAT\"|\"TIN\"|\"TAR\",\"qty\":<int>," &
-  "\"price\":<int>},\"notes\":\"...\"} (put ticket, side, commodity, qty, " &
-  "and price inside confirm, never at top level)."
+  "Put your action in a final JSON block, for example " &
+  "{\"channel\":\"RADIO\",\"text\":\"SELL 2 TIN AT 9\"}. " &
+  "To confirm a ticket add \"confirm\":{\"ticket\":1,\"side\":\"SELL\"," &
+  "\"commodity\":\"TIN\",\"qty\":2,\"price\":9}, using the actual ticket and terms. " &
+  "Use the optional \"notes\" string for private memory."
 
 proc operatorBlock(prompt: string): string =
   if prompt.len == 0:
@@ -423,68 +404,11 @@ proc operatorBlock(prompt: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc unwrapMarkdownFence(text: string): string =
-  let openIdx = text.find("```")
-  if openIdx < 0:
-    return ""
-  let newlineIdx = text.find('\n', openIdx + 3)
-  if newlineIdx < 0:
-    return ""
-  let bodyStart = newlineIdx + 1
-  let closeIdx = text.find("```", bodyStart)
-  if closeIdx <= bodyStart:
-    return ""
-  text[bodyStart ..< closeIdx].strip()
-
-proc findBalancedJsonObject(text: string, fromIdx = 0): tuple[start, stop: int] =
-  let start = text.find('{', fromIdx)
-  if start < 0:
-    return (-1, -1)
-  var depth = 0
-  var inString = false
-  var escaped = false
-  for idx in start ..< text.len:
-    let ch = text[idx]
-    if inString:
-      if escaped:
-        escaped = false
-      elif ch == '\\':
-        escaped = true
-      elif ch == '"':
-        inString = false
-    else:
-      if ch == '"':
-        inString = true
-      elif ch == '{':
-        inc depth
-      elif ch == '}':
-        dec depth
-        if depth == 0:
-          return (start, idx)
-  (-1, -1)
-
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first balanced {...} object out of a model response, tolerating
-  ## UTF-8 BOMs, markdown code fences, braces inside JSON strings, and trailing
-  ## prose (even if trailing prose contains braces).
-  var cleaned = text
-  if cleaned.startsWith("\xEF\xBB\xBF"):
-    cleaned = cleaned[3 .. ^1]
-  let fenced = unwrapMarkdownFence(cleaned)
-  let candidate = if fenced.len > 0 and '{' in fenced: fenced else: cleaned
-  let (start, stop) = findBalancedJsonObject(candidate)
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model sent
-    ## instead of JSON (prose, a refusal, a cut-off analysis...).
-    var head = cleaned.strip()
-    if head.len > 160:
-      head = head[0 ..< 160] & "..."
-    raise newException(GarbleError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  let parsed = parseJson(candidate[start .. stop])
-  if parsed.kind != JObject:
-    raise newException(GarbleError, "JSON response must be an object")
-  parsed
+  try:
+    result = strictRawObject(text)
+  except ValueError as error:
+    raise newException(GarbleError, "invalid JSON object in response: " & error.msg)
 
 proc requestFor(client: LlmClient, system, user: string, slot: int):
     tuple[url: string, headers: HttpHeaders, body: string] =
@@ -520,24 +444,18 @@ proc requestFor(client: LlmClient, system, user: string, slot: int):
 
 proc textOf(client: LlmClient, response: Response, error, url: string):
     string =
-  ## The text of one batched reply, or a GarbleError describing why there is
-  ## none. Auth failures disable the client for the rest of the episode;
-  ## model-access and throttle failures rotate the Bedrock model for the
-  ## next batch.
+  ## The text of one reply, or a GarbleError describing why there is none.
+  ## Auth failures disable the client for the rest of the episode; provider
+  ## errors fail cleanly without rotating to alternate models.
   if error.len > 0:
     raise newException(GarbleError, "llm transport: " & error)
   if response.code == 401 or response.code == 403:
     let detail = response.body[0 .. min(response.body.high, 400)]
-    if "Model access is denied" in response.body and
-        client.tryNextBedrockModel("no model access"):
-      raise newException(GarbleError,
-        "bedrock model access denied: " & detail)
     client.disabled = true
     raise newException(GarbleError,
       "llm auth failed (" & $response.code & ") at " & url & ": " & detail)
   if response.code == 429:
     let detail = response.body[0 .. min(response.body.high, 300)]
-    discard client.tryNextBedrockModel("throttled")
     raise newException(GarbleError, "llm throttled (429): " & detail)
   if response.code < 200 or response.code >= 300:
     raise newException(GarbleError, "anthropic error " & $response.code &
@@ -564,77 +482,68 @@ proc cleanText*(text: string, limit: int): string =
 # ---- Reply parsing ----------------------------------------------------------
 
 proc parseChannel(sim: Sim, seat: int, node: JsonNode): int =
-  ## Lenient by design: an unknown value — including this seat's own alias —
-  ## is the radio, never an error.
-  if node.isNil or node.kind != JString:
+  ## Optional field defaulting to RADIO when omitted; when supplied it must be
+  ## "RADIO" or another seat's exact alias.
+  if node.isNil:
     return Radio
-  let text = cleanText(node.getStr(), MaxChannelRunes).strip()
-  if text.len == 0 or text.toLowerAscii() == "radio":
+  if node.kind != JString:
+    raise newException(GarbleError, "channel must be a string")
+  let text = node.getStr()
+  if text == "RADIO":
     return Radio
   for other in 0 ..< Seats:
-    if other != seat and cmpIgnoreCase(sim.names[other], text) == 0:
+    if other != seat and sim.names[other] == text:
       return other
-  Radio
+  raise newException(GarbleError, "invalid channel: " & text)
 
-proc parseNumber(node: JsonNode, field: string, limit: int): int =
-  ## An integer, a numeric string, a float (rounded), or a spelled number
-  ## word. Out of range is ILL-FORMED, which is retried once and then falls
-  ## back — unlike an inadmissible confirm, which is a legal move.
+proc parseIntField(node: JsonNode, field: string, minVal, maxVal: int): int =
   if node.isNil:
     raise newException(GarbleError, "confirm is missing " & field)
-  var value = -1
-  case node.kind
-  of JInt:
-    value = node.getInt()
-  of JFloat:
-    value = int(round(node.getFloat()))
-  of JString:
-    let text = node.getStr().strip()
-    let spelled = wordValue(text.toUpperAscii())
-    if spelled >= 0:
-      value = spelled
-    else:
-      try:
-        value = int(round(parseFloat(text)))
-      except ValueError:
-        raise newException(GarbleError, field & " is not a number: " & text)
-  else:
-    raise newException(GarbleError, field & " must be a number: " & $node)
-  if value < 0 or value > limit:
+  if node.kind != JInt:
+    raise newException(GarbleError, field & " must be an integer: " & $node)
+  let value = node.getInt()
+  if value < minVal or value > maxVal:
     raise newException(GarbleError,
-      field & " must be 0.." & $limit & ": " & $value)
+      field & " must be " & $minVal & ".." & $maxVal & ": " & $value)
   value
 
 proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
+  if payload.isNil or payload.kind != JObject:
+    raise newException(GarbleError, "decision action must be an object")
+  if not hasUnambiguousAction(payload):
+    raise newException(GarbleError, "reply must identify one documented action")
   result.channel = parseChannel(sim, seat, payload{"channel"})
-  result.text = cleanText(payload{"text"}.getStr(), MaxTextRunes)
-    .replace("\n", " ")
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesRunes)
+  let textNode = payload{"text"}
+  if not textNode.isNil:
+    if textNode.kind != JString:
+      raise newException(GarbleError, "text must be a string")
+    result.text = cleanText(textNode.getStr(), MaxTextRunes)
+      .replace("\n", " ")
+  let notesNode = payload{"notes"}
+  if not notesNode.isNil:
+    if notesNode.kind != JString:
+      raise newException(GarbleError, "notes must be a string")
+    result.notes = cleanText(notesNode.getStr(), MaxNotesRunes)
   let confirm = payload{"confirm"}
   if confirm.isNil or confirm.kind == JNull:
     return
   if confirm.kind != JObject:
     raise newException(GarbleError, "confirm must be an object or null")
-  let ticket = confirm{"ticket"}
-  if ticket.isNil:
-    raise newException(GarbleError, "confirm is missing ticket")
-  var id = -1
-  case ticket.kind
-  of JInt: id = ticket.getInt()
-  of JFloat: id = int(round(ticket.getFloat()))
-  of JString:
-    try:
-      id = int(round(parseFloat(ticket.getStr().strip())))
-    except ValueError:
-      raise newException(GarbleError, "ticket is not a number")
-  else:
-    raise newException(GarbleError, "ticket must be a number")
-  if id < 1:
-    raise newException(GarbleError, "ticket must be at least 1: " & $id)
-  let sideText = confirm{"side"}.getStr().strip().toUpperAscii()
+  for key in confirm.keys:
+    if key notin ["ticket", "side", "commodity", "qty", "price"]:
+      raise newException(GarbleError, "unknown confirm field: " & key)
+  let id = parseIntField(confirm{"ticket"}, "ticket", 1, high(int))
+  let sideNode = confirm{"side"}
+  if sideNode.isNil or sideNode.kind != JString:
+    raise newException(GarbleError, "confirm side must be SELL or BUY")
+  let sideText = sideNode.getStr()
   if sideText != $sdSell and sideText != $sdBuy:
     raise newException(GarbleError, "side must be SELL or BUY: " & sideText)
-  let commodityText = confirm{"commodity"}.getStr().strip().toUpperAscii()
+  let commodityNode = confirm{"commodity"}
+  if commodityNode.isNil or commodityNode.kind != JString:
+    raise newException(GarbleError,
+      "confirm commodity must be ORE, OAT, TIN or TAR")
+  let commodityText = commodityNode.getStr()
   let commodity = commodityIndex(commodityText)
   if commodity < 0:
     raise newException(GarbleError,
@@ -643,8 +552,8 @@ proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
   result.ticket = id
   result.side = if sideText == $sdSell: sdSell else: sdBuy
   result.commodity = commodity
-  result.qty = parseNumber(confirm{"qty"}, "qty", MaxQty)
-  result.price = parseNumber(confirm{"price"}, "price", MaxPrice)
+  result.qty = parseIntField(confirm{"qty"}, "qty", 0, MaxQty)
+  result.price = parseIntField(confirm{"price"}, "price", 0, MaxPrice)
 
 # ---- Ordinary player inference ---------------------------------------------
 
@@ -683,7 +592,8 @@ proc choosePromptAction*(client: LlmClient, view: JsonNode, prompt: string,
       raise newException(GarbleError, "model decision must be an object")
   except CatchableError as error:
     if capturing:
-      attempt.rejectionReason = some(safeDiagnostic(error.msg))
+      if attempt.rejectionReason.isNone:
+        attempt.rejectionReason = some(safeDiagnostic(error.msg))
       if attempt.latencyMs.isNone: attempt.latencyMs = some((epochTime() - started) * 1000.0)
       if attempt.responseComplete.isNone: attempt.responseComplete = some(false)
       try: capture.evidence = privateEnvelope(attempt, request.body)

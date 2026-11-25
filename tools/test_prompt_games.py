@@ -87,13 +87,18 @@ def play(variant, seed, wording="canonical", prompt_seed=0, notes=False):
                 for other in range(5):
                     if other != seat:
                         assert f"PRIVATE-SEAT-{other}" not in messages[1]["content"]
-                if action["confirm"] is not None:
-                    action["confirm"]["qty"] = str(action["confirm"]["qty"])
-                    action["confirm"]["price"] = str(action["confirm"]["price"])
-                    action["confirm"]["side"] = action["confirm"]["side"].lower()
             trace.append((view, messages[1]["content"], expected))
             if wording == "canonical" and index == 0 and not notes:
-                for invalid in ("not JSON", '{"confirm": {}}'):
+                for invalid in (
+                    "not JSON",
+                    '{"confirm": {}}',
+                    '{"channel": "Nobody", "text": "x"}',
+                    '{"ticket": 1, "text": "SELL 5 ORE AT 12"}',
+                    '{"confirm": {"ticket": "1", "side": "SELL", "commodity": "ORE", "qty": 5, "price": 12}}',
+                    '{"confirm": {"ticket": 1, "side": "sell", "commodity": "ORE", "qty": 5, "price": 12}}',
+                    'Here you go: {"text": "SELL 5 ORE AT 12"}',
+                    '{"text": "a"}{"text": "b"}',
+                ):
                     rejected = request(
                         {"kind": "step", "decision_id": index, "response": invalid}
                     )
