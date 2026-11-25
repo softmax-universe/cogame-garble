@@ -195,6 +195,8 @@ def main():
                         + ', "notes": "duplicate retained original"}'
                     )
                 text = "```json\n" + raw_action + "\n```"
+                if args.case == "positive" and turn == 5 and seat == 1:
+                    text = "Checked market.\n```json\n" + raw_action
                 if args.case == "large":
                     # Large valid JSON completion (whitespace inside JSON object).
                     text = "```json\n" + (" " * 7600) + raw_action + "\n```"

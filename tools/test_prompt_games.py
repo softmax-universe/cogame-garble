@@ -98,6 +98,8 @@ def play(variant, seed, wording="canonical", prompt_seed=0, notes=False):
                     '{"confirm": {"ticket": 1, "side": "sell", "commodity": "ORE", "qty": 5, "price": 12}}',
                     'Here you go: {"text": "SELL 5 ORE AT 12"}',
                     '{"text": "a"}{"text": "b"}',
+                    '```json\n{"text": "SELL 5 ORE AT 12"',
+                    '```json\n{"text": "a"}\n{"text": "b"}',
                 ):
                     rejected = request(
                         {"kind": "step", "decision_id": index, "response": invalid}
@@ -106,7 +108,9 @@ def play(variant, seed, wording="canonical", prompt_seed=0, notes=False):
                     assert rejected["observation"]["decision_id"] == index
             formatted = (
                 f"```json\n{json.dumps(action)}\n```"
-                if index % 2 == 0
+                if index % 3 == 0
+                else f"Checked prices.\n```json\n{json.dumps(action)}"
+                if index % 3 == 1
                 else json.dumps(action)
             )
             response = request(

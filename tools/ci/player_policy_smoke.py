@@ -35,7 +35,31 @@ prompt_profile = next(p for p in manifest["player"] if p["id"] == "garble-player
     "env", {}
 )
 sys.path.insert(0, str(ROOT / "players/ordinary"))
-from player import baseline_action  # noqa: E402
+from player import baseline_action, extract_json_object  # noqa: E402
+
+assert extract_json_object('```json\n{"text":"SELL 5 ORE AT 12","confirm":null}') == {
+    "text": "SELL 5 ORE AT 12",
+    "confirm": None,
+}
+assert extract_json_object(
+    'Checking prices first.\n```json\n{"channel":"RADIO","text":"SELL 5 ORE AT 12","confirm":null}'
+) == {
+    "channel": "RADIO",
+    "text": "SELL 5 ORE AT 12",
+    "confirm": None,
+}
+for _bad in (
+    '```json\n{"text":"SELL 5 ORE AT 12"',
+    '```json\n{"text":"SELL 5 ORE AT 12"}\n{"text":"BUY 5 TIN AT 10"}',
+    '```json\n{"text":"a"}\n```\nExtra note',
+    '```python\n{"text":"a"}',
+):
+    try:
+        extract_json_object(_bad)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"Python extract_json_object accepted {_bad!r}")
 
 requests = {"prompt": 0}
 
@@ -52,8 +76,13 @@ class Stub(BaseHTTPRequestHandler):
         user = body["messages"][0]["content"]
         view, _ = json.JSONDecoder().raw_decode(user)
         action = baseline_action(view, False)
+        text = (
+            f"Checking market.\n```json\n{json.dumps(action)}"
+            if view["turn"] == 5
+            else json.dumps(action)
+        )
         response = {
-            "content": [{"type": "text", "text": json.dumps(action)}],
+            "content": [{"type": "text", "text": text}],
             "stop_reason": "end_turn",
         }
         encoded = json.dumps(response).encode()
