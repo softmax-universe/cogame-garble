@@ -1,8 +1,7 @@
-## The scripted baselines: bounded, legal, and load-bearing. They are the
-## no-credentials fallback (offline certification and docker-smoke), the
-## per-seat fallback after a bad model reply, and two fieldable policies in
-## their own right — so a whole episode of them must complete without ever
-## proposing an illegal move, and the table must actually trade.
+## The scripted baselines: bounded, legal, and load-bearing. Quoter and shark
+## are two fieldable scripted policies, so a whole episode of them must
+## complete without ever proposing an illegal move, and the table must actually
+## trade. Also tests strict JSON extraction and decision parsing.
 
 import std/[algorithm, json, monotimes, os, strutils, times, unicode, unittest]
 import garble/[llm, sim]
@@ -124,13 +123,20 @@ suite "the shield is load-bearing":
       " storm ", formatFloat(storm, ffDecimal, 4)
     check quiet > storm
 
-suite "the fallback path":
-  test "player-side baselines match the game fallback without a model":
+suite "scripted baselines and client config":
+  test "player-side baselines match the offline scripted baselines":
     for name in ["ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY_URI",
         "AWS_ENDPOINT_URL_BEDROCK_RUNTIME", "AWS_BEARER_TOKEN_BEDROCK"]:
       delEnv(name)
     let client = newLlmClient(900, "claude-sonnet-5")
     check client.disabled
+    check parseScriptKind("") == skNone
+    check parseScriptKind("none") == skNone
+    check parseScriptKind("quoter") == skQuoter
+    check parseScriptKind("shark") == skShark
+    for legacy in ["1", "true", "yes", "typo"]:
+      expect GarbleError:
+        discard parseScriptKind(legacy)
     for seed in [1, 11, 42]:
       var sim = initSim(fixture(seed))
       while not sim.done:
@@ -166,7 +172,7 @@ suite "reply parsing":
 
   test "a well-formed reply parses":
     let sim = sample()
-    let decision = sim.decide("""{"channel":"radio",
+    let decision = sim.decide("""{"channel":"RADIO",
       "text":"SELL 5 5 ORE ORE AT 12 12",
       "confirm":{"ticket":7,"side":"SELL","qty":5,"commodity":"TIN",
       "price":50},"notes":"Gizmo repeats prices."}""")
@@ -179,66 +185,85 @@ suite "reply parsing":
     check decision.commodity == 2
     check decision.price == 50
     check decision.notes == "Gizmo repeats prices."
+    check sim.decide("{\"channel\":\"" & sim.names[3] & "\"}").channel == 3
 
-  test "a missing or null confirm is a legal silent settle":
+  test "omitted optional fields keep valid defaults":
     let sim = sample()
-    check not sim.decide("""{"text":"hello"}""").hasConfirm
+    let d1 = sim.decide("""{"text":"hello"}""")
+    check d1.channel == Radio
+    check d1.text == "hello"
+    check d1.notes.len == 0
+    check not d1.hasConfirm
     check not sim.decide("""{"text":"hello","confirm":null}""").hasConfirm
     check sim.decide("""{"confirm":null}""").text.len == 0
 
-  test "numbers arrive as ints, strings, floats and spelled words":
+  test "extractJsonObject accepts bare JSON or a single ordinary outer markdown fence":
     let sim = sample()
-    for body in ["""{"confirm":{"ticket":1,"side":"sell","commodity":"ore",
-        "qty":5,"price":12}}""",
-        """{"confirm":{"ticket":"1","side":"SELL","commodity":"ORE",
-        "qty":"5","price":"12"}}""",
-        """{"confirm":{"ticket":1,"side":"Sell","commodity":"Ore",
-        "qty":5.0,"price":12.4}}""",
-        """{"confirm":{"ticket":1,"side":"SELL","commodity":"ORE",
-        "qty":"five","price":"twelve"}}"""]:
-      let decision = sim.decide(body)
-      check decision.hasConfirm
-      check decision.qty == 5
-      check decision.price == 12
-      check decision.commodity == 0
-      check decision.side == sdSell
-
-  test "an unknown channel and this seat's own alias both become the radio":
-    let sim = sample()
-    check sim.decide("""{"channel":"Nobody","text":"x"}""").channel == Radio
-    check sim.decide("{\"channel\":\"" & sim.names[0] & "\"}").channel ==
-      Radio
-    check sim.decide("{\"channel\":\"" & sim.names[3].toLowerAscii() &
-      "\"}").channel == 3
-
-  test "trailing prose after the closing brace is tolerated":
-    let sim = sample()
-    let decision = sim.decide(
-      """Here you go: {"text":"SELL 5 ORE AT 12"} — hope that helps.""")
-    check decision.text == "SELL 5 ORE AT 12"
-
-  test "extractJsonObject handles UTF-8 BOM, fences, string braces, and braced trailing prose":
-    let sim = sample()
-    let bomAndBracedProse = "\xEF\xBB\xBF```json\n" &
+    let fencedJson = "\xEF\xBB\xBF```json\n" &
       """{"channel":"RADIO","text":"SELL 5 ORE AT 12","confirm":{"ticket":2,"side":"SELL","commodity":"ORE","qty":5,"price":12},"notes":"watch \"{\" and } in strings"}""" &
-      "\n```\nExtra note with {braces: 1} after fence."
-    let d1 = sim.decide(bomAndBracedProse)
+      "\n```"
+    let d1 = sim.decide(fencedJson)
     check d1.hasConfirm
     check d1.ticket == 2
     check d1.notes == """watch "{" and } in strings"""
 
-    let unfencedBracedProse =
-      """{"channel":"RADIO","text":"BUY 3 TIN AT 20","confirm":null,"notes":"ok {still inside}"} trailing {not: json}"""
-    let d2 = sim.decide(unfencedBracedProse)
+    let fencedPlain = "```\n" &
+      """{"channel":"RADIO","text":"BUY 3 TIN AT 20","confirm":null,"notes":"ok {still inside}"}""" &
+      "\n```"
+    let d2 = sim.decide(fencedPlain)
     check not d2.hasConfirm
     check d2.text == "BUY 3 TIN AT 20"
     check d2.notes == "ok {still inside}"
 
-    expect GarbleError:
-      discard extractJsonObject("\xEF\xBB\xBF{\"text\":\"unclosed\"")
-
     check "\"ticket\":<id>" in ActionReplyInstruction
     check "never at top level" in ActionReplyInstruction
+
+  test "extractJsonObject rejects surrounding prose, extra objects, and bad fences":
+    for bad in [
+      "",
+      "   \n  ",
+      "not json",
+      "[]",
+      "123",
+      "\xEF\xBB\xBF{\"text\":\"unclosed\"",
+      """Here you go: {"text":"SELL 5 ORE AT 12"} — hope that helps.""",
+      """{"text":"SELL 5 ORE AT 12"} trailing prose""",
+      """{"text":"SELL 5 ORE AT 12"} trailing {not: json}""",
+      """{"text":"a"}{"text":"b"}""",
+      "```json\n{\"text\":\"a\"}\n```\nExtra note after fence.",
+      "Intro before fence\n```json\n{\"text\":\"a\"}\n```",
+      "```json\n{\"text\":\"a\"}\n{\"text\":\"b\"}\n```",
+      "```json\n{\"text\":\"a\"}\n```\n```json\n{\"text\":\"b\"}\n```",
+      "```python\n{\"text\":\"a\"}\n```",
+      "```json\n{\"text\":\"a\"}"
+    ]:
+      expect GarbleError:
+        discard extractJsonObject(bad)
+
+  test "legacy coercions, unknown channels, and unknown keys are rejected":
+    let sim = sample()
+    for body in [
+      """{"channel":"radio","text":"x"}""",
+      """{"channel":"Nobody","text":"x"}""",
+      """{"channel":""}""",
+      """{"channel":123}""",
+      "{\"channel\":\"" & sim.names[0] & "\"}",
+      "{\"channel\":\"" & sim.names[3].toLowerAscii() & "\"}",
+      """{"text":123}""",
+      """{"notes":false}""",
+      """{"ticket":1,"text":"SELL 5 ORE AT 12"}""",
+      """{"confirm":{"ticket":1,"side":"sell","commodity":"ORE","qty":5,"price":12}}""",
+      """{"confirm":{"ticket":1,"side":"SELL","commodity":"ore","qty":5,"price":12}}""",
+      """{"confirm":{"ticket":"1","side":"SELL","commodity":"ORE","qty":5,"price":12}}""",
+      """{"confirm":{"ticket":1.0,"side":"SELL","commodity":"ORE","qty":5,"price":12}}""",
+      """{"confirm":{"ticket":1,"side":"SELL","commodity":"ORE","qty":"5","price":12}}""",
+      """{"confirm":{"ticket":1,"side":"SELL","commodity":"ORE","qty":5.0,"price":12}}""",
+      """{"confirm":{"ticket":1,"side":"SELL","commodity":"ORE","qty":"five","price":12}}""",
+      """{"confirm":{"ticket":1,"side":"SELL","commodity":"ORE","qty":5,"price":"twelve"}}""",
+      """{"confirm":{"ticket":1,"side":"SELL","commodity":"ORE","qty":5,"price":12,"extra":1}}"""
+    ]:
+      expect GarbleError:
+        discard sim.decide(body)
 
   test "ill-formed confirms are rejected":
     let sim = sample()
@@ -257,10 +282,10 @@ suite "reply parsing":
       expect GarbleError:
         discard sim.decide(body)
 
-  test "text, notes and channel are capped on rune boundaries":
+  test "text and notes are capped on rune boundaries":
     let sim = sample()
-    let decision = sim.decide("""{"channel":"""" & repeat("\u97F3", 40) &
-      """","text":"""" & repeat("\u97F3", 400) & """","notes":"""" &
+    let decision = sim.decide("""{"channel":"RADIO","text":"""" &
+      repeat("\u97F3", 400) & """","notes":"""" &
       repeat("\u97F3", 900) & """"}""")
     check decision.text.runeLen == MaxTextRunes
     check decision.notes.runeLen == MaxNotesRunes

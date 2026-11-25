@@ -154,10 +154,9 @@ def main():
             )
             (out / "native-emitted-frame.bin").write_bytes(wire.encode())
             assert frame["source"] == "player"
-            if args.case == "json-vtab":
-                # The unchanged native parser rejects this before an action is
-                # emitted. Preserve its actual attempt-only frame, not a
-                # fabricated decision carrying the intended object.
+            if args.case in {"json-vtab", "utf8"}:
+                # The strict parser rejects these before an action is emitted.
+                # Preserve the actual attempt-only frame without fabricating a move.
                 assert frame["type"] == "private_attempt" and "action" not in frame
             else:
                 assert frame["type"] == "decision" and frame["action"] == action
@@ -265,13 +264,10 @@ def main():
         assert not attempt["accepted"]
     else:
         if args.case == "json-vtab":
-            assert row["action_status"] == "fallback" and not attempt["accepted"]
-            selected = next(
-                item
-                for item in row["attempts"]
-                if item["attempt_id"] == row["selected_attempt_id"]
-            )
-            assert selected["origin"] == "fallback"
+            assert row["action_status"] == "rejected" and not attempt["accepted"]
+            assert row["selected_attempt_id"] is None
+            assert row["executed_action"]["text"] == ""
+            assert row["executed_action"]["confirm"] is None
             assert attempt["rejection_reason"]
         else:
             assert row["action_status"] == "accepted" and attempt["accepted"]

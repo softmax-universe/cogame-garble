@@ -496,10 +496,6 @@ proc clipRunes(text: string, limit: int): string =
     return "\u2026"
   text.runeSubStr(0, limit - 1) & "\u2026"
 
-proc normaliseChannel*(sim: Sim, seat, channel: int): int =
-  ## Lenient: anything that is not another seat is the radio.
-  if channel >= 0 and channel < Seats and channel != seat: channel else: Radio
-
 proc applySay*(sim: var Sim, seat, channel: int, text, notes: string,
     scripted: bool) =
   ## One seat's transmission. Charges airtime, opens a ticket when the SAID
@@ -510,6 +506,8 @@ proc applySay*(sim: var Sim, seat, channel: int, text, notes: string,
     raise newException(GarbleError, "no transmission is due")
   if seat < 0 or seat >= Seats:
     raise newException(GarbleError, "bad seat: " & $seat)
+  if channel != Radio and (channel < 0 or channel >= Seats or channel == seat):
+    raise newException(GarbleError, "bad channel: " & $channel)
   if sim.said[seat]:
     raise newException(GarbleError,
       "seat " & $seat & " has already transmitted this turn")
@@ -539,7 +537,7 @@ proc applySay*(sim: var Sim, seat, channel: int, text, notes: string,
   var event = blankEvent(evSay)
   event.turn = sim.turn
   event.seat = seat
-  event.channel = sim.normaliseChannel(seat, channel)
+  event.channel = channel
   event.text = line
   event.cost = cost
   event.airtimeLeft = sim.airtime[seat]

@@ -93,6 +93,35 @@ def baseline_action(view: dict, shark: bool) -> dict:
     return {"channel": "RADIO", "text": text, "notes": "", "confirm": confirm}
 
 
+def extract_json_object(text: str) -> dict:
+    """Parse one JSON object, bare or inside a single ordinary outer Markdown code fence."""
+    cleaned = text.removeprefix("\ufeff").strip()
+    if not cleaned:
+        raise ValueError("empty Garble model response")
+    body = cleaned
+    if cleaned.startswith("```"):
+        newline = cleaned.find("\n")
+        if newline < 0:
+            raise ValueError("unclosed markdown code fence")
+        tag = cleaned[3:newline].strip().lower()
+        if tag not in ("", "json"):
+            raise ValueError(f"unsupported markdown code fence language: {tag}")
+        rest = cleaned[newline + 1 :]
+        if not rest.endswith("```"):
+            raise ValueError("unclosed markdown code fence")
+        before_close = rest[:-3]
+        if before_close:
+            last_newline = before_close.rfind("\n")
+            indent = before_close if last_newline < 0 else before_close[last_newline + 1 :]
+            if indent.strip(" \t\r"):
+                raise ValueError("closing markdown fence must be on its own line")
+        body = before_close.strip()
+    action = json.loads(body)
+    if not isinstance(action, dict):
+        raise ValueError("trained Garble decision must be a JSON object")
+    return action
+
+
 def choose(turn: dict, generator) -> tuple[dict, str]:
     operator_prompt = os.environ.get("PLAYER_PROMPT", "")
     parts = [json.dumps(turn["view"], separators=(",", ":"), ensure_ascii=False)]
@@ -107,9 +136,7 @@ def choose(turn: dict, generator) -> tuple[dict, str]:
                 {"role": "user", "content": turn["user"]},
             ]
         )
-        action = json.loads(completion)
-        if not isinstance(action, dict):
-            raise ValueError("trained Garble decision must be a JSON object")
+        action = extract_json_object(completion)
         return action, "trained"
     return baseline_action(turn["view"], False), "canned"
 
@@ -143,7 +170,19 @@ def main() -> None:
         frame = json.loads(data)
         kind = frame["type"]
         if kind == "turn":
-            action, source = choose(frame, generator)
+            try:
+                action, source = choose(frame, generator)
+            except ValueError as exc:
+                socket.send(
+                    json.dumps(
+                        {
+                            "type": "decision_failed",
+                            "turn": frame["turn"],
+                            "reason": str(exc),
+                        }
+                    )
+                )
+                continue
             pending[frame["turn"]] = (frame, action, source)
             socket.send(
                 json.dumps(
@@ -156,8 +195,9 @@ def main() -> None:
                 )
             )
         elif kind == "decision_result":
-            turn, action, source = pending.pop(frame["turn"])
-            if artifact and frame["accepted"]:
+            item = pending.pop(frame["turn"], None)
+            if item is not None and artifact and frame["accepted"]:
+                turn, action, source = item
                 artifact.record(
                     turn["system"],
                     turn["user"],

@@ -174,7 +174,7 @@ def main():
                     )
                 )
                 if args.case == "boundary" and turn == 0 and seat == 0:
-                    action["unknown_padding"] = ""
+                    action["notes"] = ""
                     frame = {
                         "type": "decision",
                         "turn": turn,
@@ -184,7 +184,7 @@ def main():
                     compact = json.dumps(
                         frame, ensure_ascii=False, separators=(",", ":")
                     )
-                    action["unknown_padding"] = "x" * (65500 - len(compact.encode()))
+                    action["notes"] = "x" * (65500 - len(compact.encode()))
                 raw_action = json.dumps(action, ensure_ascii=False)
                 if args.case == "normalization" and seat == 3:
                     if turn == 0:
@@ -196,11 +196,8 @@ def main():
                         raw_action = raw_action[:-1] + ', "unknown_nonfinite": NaN}'
                 text = "```json\n" + raw_action + "\n```"
                 if args.case == "large":
-                    # A large original completion with native legal fields; padding
-                    # stays outside the JSON object under the unchanged decoder.
-                    # 900 Haiku tokens have no universal byte ceiling; this is an
-                    # explicit 8KiB response-size stress, not a tokenizer claim.
-                    text = ("analysis " * 850) + text
+                    # Large valid JSON completion (whitespace inside JSON object).
+                    text = "```json\n" + (" " * 7600) + raw_action + "\n```"
                 payload = {
                     "model": body["model"],
                     "content": [{"type": "text", "text": text}],
@@ -585,7 +582,14 @@ def main():
                     "legal void was filtered by outcome"
                 )
             if args.case in ("http429", "malformed", "timeout"):
-                assert counts["fallback"] == 1
+                assert counts["fallback"] == 0
+                failed_row = next(r for r in rows[:-1] if r["decision_id"] == "0-0")
+                assert failed_row["action_status"] == (
+                    "missing" if args.case == "timeout" else "rejected"
+                )
+                assert failed_row["selected_attempt_id"] is None
+                assert failed_row["executed_action"]["text"] == ""
+                assert failed_row["executed_action"]["confirm"] is None
             if args.case == "adversarial":
                 assert counts["invalid_telemetry"] >= 5
                 assert counts["fallback"] == 0

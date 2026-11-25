@@ -25,7 +25,7 @@ type
     observation, actual: JsonNode
     frames: seq[CapturedFrame]
     selected: int
-    fallback: bool
+    failed: bool
   RuntimeCapture* = ref object
     trajectory: DecisionTrajectory
     turns: Table[int, seq[CapturedDecision]]
@@ -370,14 +370,13 @@ proc rejectedFrame*(capture: RuntimeCapture, turn, seat, index: int, reason: str
   capture.turns[turn][seat].frames[index].diagnostic["disposition"] = %reason
 
 proc appliedCaptureTurn*(capture: RuntimeCapture, sim: Sim,
-    fallback, mixedOrigins: seq[bool]) =
+    failed: seq[bool]) =
   if capture == nil: return
   for seat in 0 ..< Seats:
     let decision = capture.turns[sim.turn][seat]
-    decision.fallback = fallback[seat]
+    decision.failed = failed[seat]
     decision.observation["execution_origin"] = %(
-      if mixedOrigins[seat]: "mixed native-quoter transmission and original confirmation"
-      elif fallback[seat]: "native-quoter fallback"
+      if failed[seat]: "turn forfeited (no valid action)"
       else: "installed socket action")
     var actual = %*{"channel": "RADIO", "text": "", "notes": sim.notes[seat], "confirm": nil}
     var events = newJArray()
@@ -408,7 +407,7 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
         if frame.attempt.isNone: continue
         var attempt = frame.attempt.get()
         attempt.accepted = false
-        if index == decision.selected and not decision.fallback and
+        if index == decision.selected and not decision.failed and
             attempt.origin == aoModel and attempt.responseComplete == some(true) and
             attempt.httpStatus == some(200) and attempt.response.kind == JString and
             attempt.platformCallId.isSome:
@@ -428,13 +427,9 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
           selected = some(attempt.attemptId)
           status = asAccepted
         attempts.add(attempt)
-      if decision.fallback:
-        var actual = newDecisionAttempt($turn & "-" & $seat & "-fallback", "engine-fallback-or-mixed", aoFallback)
-        actual.parsedAction = copy(decision.actual)
-        actual.accepted = true
-        attempts.add(actual)
-        selected = some(actual.attemptId)
-        status = asFallback
+      if decision.failed:
+        selected = none(string)
+        status = if attempts.len > 0: asRejected else: asMissing
       decision.observation["strict_raw_fields_enforced"] = %true
       decision.observation["authenticated_receipt_audit_required"] = %true
       var observation = decision.observation
@@ -442,23 +437,22 @@ proc finishCapture*(capture: RuntimeCapture, outcome: JsonNode) =
       var originalAttempts = newJArray()
       for attempt in attempts: originalAttempts.add(attemptEvidenceJson(attempt))
       let original = %*{"observation": observation, "attempts": originalAttempts,
-        "executed_action": actual, "actual_scripted": decision.fallback}
+        "executed_action": actual, "actual_scripted": false}
       var unsafe = not scalarJson(original)
       for frame in decision.frames:
         if frame.diagnostic{"non_unicode_evidence"}.getBool(): unsafe = true
       if unsafe:
         let detail = "non-Unicode native evidence; original JSON bytes retained as base64; target excluded"
-        observation = %*{"capture_errors": [detail], "actual_scripted": decision.fallback,
+        observation = %*{"capture_errors": [detail], "actual_scripted": false,
           "invalid_native_evidence_json_b64": encode($original)}
         attempts = @[]
         selected = none(string)
         actual = newJNull()
-        if status != asFallback: status = asRejected
+        status = asRejected
         capture.failed = true
         if capture.errors.len < 16: capture.errors.add(detail)
       capture.trajectory.recordDecision($turn & "-" & $seat, $seat,
-        observation, attempts, selected, actual, status,
-        fallbackOrigin = (if decision.fallback: some("engine-fallback-or-mixed") else: none(string)))
+        observation, attempts, selected, actual, status)
   var privateOutcome = copy(outcome)
   var scores = outcome{"scores"}
   if not scalarJson(outcome):

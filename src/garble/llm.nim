@@ -7,13 +7,14 @@
 ##   Bedrock bearer token            - local play
 ##   ANTHROPIC_API_KEY                - the key itself
 ##   ANTHROPIC_API_KEY_URI            - a URI holding the key
-## Without a model credential the bundled prompt player sends a quoter
-## fallback. Quoter and shark are also fieldable scripted player policies.
+## Without a model credential the bundled prompt player is disabled and fails
+## its turns rather than substituting a scripted move. Quoter and shark are
+## fieldable scripted player policies.
 
 import ./prompts
 
 import
-  std/[json, math, os, strutils, times, unicode],
+  std/[json, os, strutils, times, unicode],
   bitworld/runtime,
   curly,
   sim,
@@ -58,12 +59,13 @@ type
     disabled*: bool             ## true once credentials are known-unavailable
 
 proc parseScriptKind*(text: string): ScriptKind =
-  ## PLAYER_SCRIPTED values: "1"/"true"/"yes"/"quoter" play the honest
-  ## quoter, "shark" the strategic mishearer, anything else nothing.
+  ## PLAYER_SCRIPTED values: "quoter" plays the honest quoter, "shark" the
+  ## strategic mishearer, empty string or "none" selects the prompt player.
   case text.strip().toLowerAscii()
-  of "1", "true", "yes", "quoter": skQuoter
+  of "", "none": skNone
+  of "quoter": skQuoter
   of "shark": skShark
-  else: skNone
+  else: raise newException(GarbleError, "unknown PLAYER_SCRIPTED value: " & text)
 
 proc resolveApiKey(): string =
   result = getEnv("ANTHROPIC_API_KEY").strip()
@@ -144,7 +146,7 @@ proc newLlmClient*(maxOutputTokens: int, model: string): LlmClient =
   else:
     result.transport = ltNone
     result.disabled = true
-    echo "garble llm: no LLM credentials; using scripted fallback"
+    echo "garble llm: no LLM credentials; prompt player disabled"
 
 # ---- Scripted baselines -----------------------------------------------------
 
@@ -423,65 +425,52 @@ proc operatorBlock(prompt: string): string =
 
 # ---- Anthropic / Bedrock transport ------------------------------------------
 
-proc unwrapMarkdownFence(text: string): string =
-  let openIdx = text.find("```")
-  if openIdx < 0:
-    return ""
-  let newlineIdx = text.find('\n', openIdx + 3)
+proc unwrapSingleOuterFence(text: string): string =
+  ## Accepts either bare text or text wrapped in a single ordinary outer
+  ## Markdown code fence (JSON-tagged or plain). Rejects malformed fences or
+  ## unsupported language tags.
+  if not text.startsWith("```"):
+    return text
+  let newlineIdx = text.find('\n')
   if newlineIdx < 0:
-    return ""
-  let bodyStart = newlineIdx + 1
-  let closeIdx = text.find("```", bodyStart)
-  if closeIdx <= bodyStart:
-    return ""
-  text[bodyStart ..< closeIdx].strip()
-
-proc findBalancedJsonObject(text: string, fromIdx = 0): tuple[start, stop: int] =
-  let start = text.find('{', fromIdx)
-  if start < 0:
-    return (-1, -1)
-  var depth = 0
-  var inString = false
-  var escaped = false
-  for idx in start ..< text.len:
-    let ch = text[idx]
-    if inString:
-      if escaped:
-        escaped = false
-      elif ch == '\\':
-        escaped = true
-      elif ch == '"':
-        inString = false
-    else:
-      if ch == '"':
-        inString = true
-      elif ch == '{':
-        inc depth
-      elif ch == '}':
-        dec depth
-        if depth == 0:
-          return (start, idx)
-  (-1, -1)
+    raise newException(GarbleError, "unclosed markdown code fence")
+  let tag = text[3 ..< newlineIdx].strip().toLowerAscii()
+  if tag.len > 0 and tag != "json":
+    raise newException(GarbleError,
+      "unsupported markdown code fence language: " & tag)
+  let rest = text[newlineIdx + 1 .. ^1]
+  if not rest.endsWith("```"):
+    raise newException(GarbleError, "unclosed markdown code fence")
+  let beforeClose = rest[0 ..< rest.len - 3]
+  if beforeClose.len > 0:
+    let lastNewline = beforeClose.rfind('\n')
+    let indent =
+      if lastNewline < 0: beforeClose
+      else: beforeClose[lastNewline + 1 .. ^1]
+    if indent.strip(chars = {' ', '\t', '\r'}).len > 0:
+      raise newException(GarbleError, "closing markdown fence must be on its own line")
+  beforeClose.strip()
 
 proc extractJsonObject*(text: string): JsonNode =
-  ## Pulls the first balanced {...} object out of a model response, tolerating
-  ## UTF-8 BOMs, markdown code fences, braces inside JSON strings, and trailing
-  ## prose (even if trailing prose contains braces).
+  ## Parses exactly one JSON object, either bare or inside a single ordinary
+  ## outer Markdown code fence (JSON-tagged or plain). Rejects surrounding
+  ## prose, extra JSON objects, and non-object JSON values.
   var cleaned = text
   if cleaned.startsWith("\xEF\xBB\xBF"):
     cleaned = cleaned[3 .. ^1]
-  let fenced = unwrapMarkdownFence(cleaned)
-  let candidate = if fenced.len > 0 and '{' in fenced: fenced else: cleaned
-  let (start, stop) = findBalancedJsonObject(candidate)
-  if start < 0 or stop <= start:
-    ## Quote the head of the reply so a hosted log shows WHAT the model sent
-    ## instead of JSON (prose, a refusal, a cut-off analysis...).
-    var head = cleaned.strip()
+  cleaned = cleaned.strip()
+  if cleaned.len == 0:
+    raise newException(GarbleError, "empty response")
+  let body = unwrapSingleOuterFence(cleaned)
+  var parsed: JsonNode
+  try:
+    parsed = parseJson(body)
+  except JsonParsingError as error:
+    var head = cleaned
     if head.len > 160:
       head = head[0 ..< 160] & "..."
-    raise newException(GarbleError, "no JSON object in response: " &
-      head.replace("\n", " "))
-  let parsed = parseJson(candidate[start .. stop])
+    raise newException(GarbleError, "invalid JSON object in response (" &
+      error.msg & "): " & head.replace("\n", " "))
   if parsed.kind != JObject:
     raise newException(GarbleError, "JSON response must be an object")
   parsed
@@ -564,77 +553,69 @@ proc cleanText*(text: string, limit: int): string =
 # ---- Reply parsing ----------------------------------------------------------
 
 proc parseChannel(sim: Sim, seat: int, node: JsonNode): int =
-  ## Lenient by design: an unknown value — including this seat's own alias —
-  ## is the radio, never an error.
-  if node.isNil or node.kind != JString:
+  ## Optional field defaulting to RADIO when omitted; when supplied it must be
+  ## "RADIO" or another seat's exact alias.
+  if node.isNil:
     return Radio
-  let text = cleanText(node.getStr(), MaxChannelRunes).strip()
-  if text.len == 0 or text.toLowerAscii() == "radio":
+  if node.kind != JString:
+    raise newException(GarbleError, "channel must be a string")
+  let text = node.getStr()
+  if text == "RADIO":
     return Radio
   for other in 0 ..< Seats:
-    if other != seat and cmpIgnoreCase(sim.names[other], text) == 0:
+    if other != seat and sim.names[other] == text:
       return other
-  Radio
+  raise newException(GarbleError, "invalid channel: " & text)
 
-proc parseNumber(node: JsonNode, field: string, limit: int): int =
-  ## An integer, a numeric string, a float (rounded), or a spelled number
-  ## word. Out of range is ILL-FORMED, which is retried once and then falls
-  ## back — unlike an inadmissible confirm, which is a legal move.
+proc parseIntField(node: JsonNode, field: string, minVal, maxVal: int): int =
   if node.isNil:
     raise newException(GarbleError, "confirm is missing " & field)
-  var value = -1
-  case node.kind
-  of JInt:
-    value = node.getInt()
-  of JFloat:
-    value = int(round(node.getFloat()))
-  of JString:
-    let text = node.getStr().strip()
-    let spelled = wordValue(text.toUpperAscii())
-    if spelled >= 0:
-      value = spelled
-    else:
-      try:
-        value = int(round(parseFloat(text)))
-      except ValueError:
-        raise newException(GarbleError, field & " is not a number: " & text)
-  else:
-    raise newException(GarbleError, field & " must be a number: " & $node)
-  if value < 0 or value > limit:
+  if node.kind != JInt:
+    raise newException(GarbleError, field & " must be an integer: " & $node)
+  let value = node.getInt()
+  if value < minVal or value > maxVal:
     raise newException(GarbleError,
-      field & " must be 0.." & $limit & ": " & $value)
+      field & " must be " & $minVal & ".." & $maxVal & ": " & $value)
   value
 
 proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
+  if payload.isNil or payload.kind != JObject:
+    raise newException(GarbleError, "decision action must be an object")
+  for key in payload.keys:
+    if key notin ["channel", "text", "notes", "confirm"]:
+      raise newException(GarbleError, "unknown decision field: " & key)
   result.channel = parseChannel(sim, seat, payload{"channel"})
-  result.text = cleanText(payload{"text"}.getStr(), MaxTextRunes)
-    .replace("\n", " ")
-  result.notes = cleanText(payload{"notes"}.getStr(), MaxNotesRunes)
+  let textNode = payload{"text"}
+  if not textNode.isNil:
+    if textNode.kind != JString:
+      raise newException(GarbleError, "text must be a string")
+    result.text = cleanText(textNode.getStr(), MaxTextRunes)
+      .replace("\n", " ")
+  let notesNode = payload{"notes"}
+  if not notesNode.isNil:
+    if notesNode.kind != JString:
+      raise newException(GarbleError, "notes must be a string")
+    result.notes = cleanText(notesNode.getStr(), MaxNotesRunes)
   let confirm = payload{"confirm"}
   if confirm.isNil or confirm.kind == JNull:
     return
   if confirm.kind != JObject:
     raise newException(GarbleError, "confirm must be an object or null")
-  let ticket = confirm{"ticket"}
-  if ticket.isNil:
-    raise newException(GarbleError, "confirm is missing ticket")
-  var id = -1
-  case ticket.kind
-  of JInt: id = ticket.getInt()
-  of JFloat: id = int(round(ticket.getFloat()))
-  of JString:
-    try:
-      id = int(round(parseFloat(ticket.getStr().strip())))
-    except ValueError:
-      raise newException(GarbleError, "ticket is not a number")
-  else:
-    raise newException(GarbleError, "ticket must be a number")
-  if id < 1:
-    raise newException(GarbleError, "ticket must be at least 1: " & $id)
-  let sideText = confirm{"side"}.getStr().strip().toUpperAscii()
+  for key in confirm.keys:
+    if key notin ["ticket", "side", "commodity", "qty", "price"]:
+      raise newException(GarbleError, "unknown confirm field: " & key)
+  let id = parseIntField(confirm{"ticket"}, "ticket", 1, high(int))
+  let sideNode = confirm{"side"}
+  if sideNode.isNil or sideNode.kind != JString:
+    raise newException(GarbleError, "confirm side must be SELL or BUY")
+  let sideText = sideNode.getStr()
   if sideText != $sdSell and sideText != $sdBuy:
     raise newException(GarbleError, "side must be SELL or BUY: " & sideText)
-  let commodityText = confirm{"commodity"}.getStr().strip().toUpperAscii()
+  let commodityNode = confirm{"commodity"}
+  if commodityNode.isNil or commodityNode.kind != JString:
+    raise newException(GarbleError,
+      "confirm commodity must be ORE, OAT, TIN or TAR")
+  let commodityText = commodityNode.getStr()
   let commodity = commodityIndex(commodityText)
   if commodity < 0:
     raise newException(GarbleError,
@@ -643,8 +624,8 @@ proc parseDecision*(sim: Sim, seat: int, payload: JsonNode): Decision =
   result.ticket = id
   result.side = if sideText == $sdSell: sdSell else: sdBuy
   result.commodity = commodity
-  result.qty = parseNumber(confirm{"qty"}, "qty", MaxQty)
-  result.price = parseNumber(confirm{"price"}, "price", MaxPrice)
+  result.qty = parseIntField(confirm{"qty"}, "qty", 0, MaxQty)
+  result.price = parseIntField(confirm{"price"}, "price", 0, MaxPrice)
 
 # ---- Ordinary player inference ---------------------------------------------
 
@@ -683,7 +664,8 @@ proc choosePromptAction*(client: LlmClient, view: JsonNode, prompt: string,
       raise newException(GarbleError, "model decision must be an object")
   except CatchableError as error:
     if capturing:
-      attempt.rejectionReason = some(safeDiagnostic(error.msg))
+      if attempt.rejectionReason.isNone:
+        attempt.rejectionReason = some(safeDiagnostic(error.msg))
       if attempt.latencyMs.isNone: attempt.latencyMs = some((epochTime() - started) * 1000.0)
       if attempt.responseComplete.isNone: attempt.responseComplete = some(false)
       try: capture.evidence = privateEnvelope(attempt, request.body)

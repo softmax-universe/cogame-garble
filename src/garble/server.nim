@@ -49,6 +49,7 @@ type
     pendingTurn: int
     pendingDecisions: Table[int, Decision]
     pendingSources: Table[int, string]
+    pendingFailed: Table[int, string]
     playerSockets: Table[int, WebSocket]
     socketSlots: Table[WebSocket, int]
     globalSockets: HashSet[WebSocket]
@@ -365,6 +366,7 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
         state.pendingTurn = simCopy.turn
         state.pendingDecisions.clear()
         state.pendingSources.clear()
+        state.pendingFailed.clear()
         if state.capture != nil:
           try: state.capture.beginCaptureTurn(simCopy)
           except CatchableError as error:
@@ -384,30 +386,39 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             state.playerSockets[seat].send($frame)
             waitingSeats.add(seat)
       while waitingSeats.len > 0 and epochTime() < decisionDeadline:
-        var received = 0
+        var resolved = 0
         withLock stateLock:
           for seat in waitingSeats:
-            if state.pendingDecisions.hasKey(seat):
-              received.inc
-        if received == waitingSeats.len:
+            if state.pendingDecisions.hasKey(seat) or
+                state.pendingFailed.hasKey(seat) or
+                not state.playerSockets.hasKey(seat):
+              resolved.inc
+        if resolved == waitingSeats.len:
           break
         sleep(20)
 
       var decisions = newSeq[Decision](Seats)
       var wasScripted = newSeq[bool](Seats)
       var accepted = newSeq[bool](Seats)
-      var mixedOrigins: seq[bool]
-      if state.capture != nil: mixedOrigins = newSeq[bool](Seats)
+      var failReasons = newSeq[string](Seats)
       withLock stateLock:
         for seat in 0 ..< Seats:
           if state.pendingDecisions.hasKey(seat):
             decisions[seat] = state.pendingDecisions[seat]
-            wasScripted[seat] = state.pendingSources[seat] != "player"
-            accepted[seat] = state.pendingSources[seat] != "fallback"
+            wasScripted[seat] = state.pendingSources[seat] == "scripted"
+            accepted[seat] = true
             continue
-          echo "garble: seat ", seat, " using scripted fallback"
-          decisions[seat] = scriptedAction(simCopy, seat, skQuoter)
-          wasScripted[seat] = true
+          failReasons[seat] =
+            if state.pendingFailed.hasKey(seat):
+              state.pendingFailed[seat]
+            elif not state.playerSockets.hasKey(seat):
+              "player disconnected"
+            else:
+              "decision timeout"
+          echo "garble: seat ", seat, " forfeited turn (", failReasons[seat], ")"
+          decisions[seat] = Decision(channel: Radio)
+          wasScripted[seat] = false
+          accepted[seat] = false
         state.pendingTurn = -1
 
       withLock stateLock:
@@ -420,12 +431,12 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
               decision.notes, wasScripted[seat])
           except GarbleError as error:
             echo "garble: transmission rejected (", error.msg,
-              "); using the scripted fallback"
-            let fallback = scriptedAction(state.sim, seat, skQuoter)
-            state.sim.applySay(seat, fallback.channel, fallback.text, "", true)
-            wasScripted[seat] = true
+              "); turn forfeited"
+            state.sim.applySay(seat, Radio, "", "", false)
+            decisions[seat].hasConfirm = false
+            wasScripted[seat] = false
             accepted[seat] = false
-            if state.capture != nil: mixedOrigins[seat] = decision.hasConfirm
+            failReasons[seat] = error.msg
           state.broadcastLocked()
         ## Confirms, in seat order, after every transmission has landed.
         for seat in 0 ..< Seats:
@@ -442,20 +453,23 @@ proc playEpisode(runtimeConfig: RuntimeConfig) {.gcsafe.} =
             echo "garble: confirm rejected (", error.msg, ")"
           state.broadcastLocked()
         if state.capture != nil:
-          var fallback = newSeq[bool](Seats)
+          var failed = newSeq[bool](Seats)
           for seat in 0 ..< Seats:
-            fallback[seat] = not accepted[seat]
-          try: state.capture.appliedCaptureTurn(state.sim, fallback, mixedOrigins)
+            failed[seat] = not accepted[seat]
+          try: state.capture.appliedCaptureTurn(state.sim, failed)
           except CatchableError as error:
             echo "garble capture: applied turn failed: ", error.msg
         state.sim.endTurn()
         state.broadcastLocked()
         for seat in 0 ..< Seats:
           if state.playerSockets.hasKey(seat):
-            state.playerSockets[seat].send($ %*{
+            var resultFrame = %*{
               "type": "decision_result", "turn": simCopy.turn,
               "accepted": accepted[seat]
-            })
+            }
+            if not accepted[seat] and failReasons[seat].len > 0:
+              resultFrame["reason"] = %failReasons[seat]
+            state.playerSockets[seat].send($resultFrame)
 
       ## Pace so a spectator can read the turn that just landed.
       if config.turnDelayMs > 0:
@@ -603,13 +617,14 @@ proc websocketHandler(
       try:
         let payload = parseJson(message.data)
         let kind = payload{"type"}.getStr()
-        if kind in ["decision", "private_attempt"]:
+        if kind in ["decision", "private_attempt", "decision_failed"]:
           let turn = payload["turn"].getInt()
           withLock stateLock:
             let current = turn == state.pendingTurn
-            let available = current and not state.pendingDecisions.hasKey(slot)
+            let available = current and not state.pendingDecisions.hasKey(slot) and
+              not state.pendingFailed.hasKey(slot)
             var captureIndex = -1
-            if state.capture != nil:
+            if state.capture != nil and kind != "decision_failed":
               try:
                 captureIndex = state.capture.receivedFrame(turn, slot, payload,
                   if not current: "late or unopened turn"
@@ -618,14 +633,18 @@ proc websocketHandler(
                   else: "received action")
               except CatchableError as error:
                 echo "garble capture: receive failed: ", error.msg
-            if kind == "decision":
+            if kind == "decision_failed":
+              if available:
+                state.pendingFailed[slot] =
+                  payload{"reason"}.getStr("player decision failed")
+            elif kind == "decision":
               try:
                 let action = payload["action"]
                 if action.kind != JObject:
                   raise newException(GarbleError, "decision action must be an object")
                 if available:
                   let source = payload{"source"}.getStr("player")
-                  if source notin ["player", "scripted", "fallback"]:
+                  if source notin ["player", "scripted"]:
                     raise newException(GarbleError, "unknown decision source")
                   let parsed = parseDecision(state.sim, slot, action)
                   state.pendingDecisions[slot] = parsed
@@ -636,6 +655,8 @@ proc websocketHandler(
                     except CatchableError as error:
                       echo "garble capture: selection failed: ", error.msg
               except CatchableError as error:
+                if available:
+                  state.pendingFailed[slot] = error.msg
                 if state.capture != nil:
                   try: state.capture.rejectedFrame(turn, slot, captureIndex, "native action rejected: " & error.msg)
                   except CatchableError: discard
@@ -705,6 +726,7 @@ proc runGameServer*(config: GameConfig, runtimeConfig: RuntimeConfig) =
   state.pendingTurn = -1
   state.pendingDecisions = initTable[int, Decision]()
   state.pendingSources = initTable[int, string]()
+  state.pendingFailed = initTable[int, string]()
   runtimeConfigGlobal = runtimeConfig
 
   let router = buildRouter(replayMode = false)

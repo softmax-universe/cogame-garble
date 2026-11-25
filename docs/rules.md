@@ -156,9 +156,10 @@ said `side`.
 1. **Open.** Expire stale tickets, publish `price[t]` and `interference[t]`.
 2. **Observe.** One observation per seat, from the state at open.
 3. **Decide.** All non-scripted seats' LLM calls go out as ONE parallel batch.
-4. **Validate -> retry once -> scripted `quoter` fallback.** An *inadmissible*
+4. **Validate.** Missing or invalid actions are rejected and forfeit the seat's
+   turn (no transmission or confirm, no fallback move). An *inadmissible*
    confirm is a perfectly legal move whose outcome is a `void`; it is never
-   retried and never falls back.
+   rejected as malformed.
 5. **Transmit, in seat order.** Text is rune-truncated to 160 runes, then to 32
    words; airtime is charged at one rune per character; an over-budget text is cut
    on a rune boundary and flagged `clipped`; an empty meter makes the turn
@@ -185,7 +186,7 @@ all cost airtime while the market moves.
 | --- | --- |
 | `text` | 160 runes, then 32 words |
 | `notes` | 400 runes |
-| `channel` | 16 runes; an unknown value (including this seat's own alias) normalises to `radio` |
+| `channel` | `"RADIO"` or another seat's exact alias (unknown values or own alias are rejected) |
 | `qty`, `price` | integers `0..99` |
 
 Every truncation is on **rune boundaries** - a string cut mid-UTF-8 renders in a
@@ -214,6 +215,6 @@ browser but fails a strict JSON parser, and every string here lands in the repla
 | `complete` | all `turns` turns were played |
 | `deadline` | the clock check fired; scores use the turns played, at the last opened turn's prices |
 
-There is no third value, no forfeit and no early win. A seat that never connects a
+There is no third value and no early win. A seat that never connects a
 player socket is not an ending: after the connect timeout the episode starts anyway
-and missing seats receive the game-owned quoter fallback.
+and missing seats forfeit their turns (no transmission or confirm).

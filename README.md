@@ -39,7 +39,8 @@ An ordinary player with canned and trained-adapter backends is in
 [`players/ordinary/`](players/ordinary/README.md).
 Two built-in **scripted baselines** — `quoter`, the honest repeater, and
 `shark`, the terse opportunist — submit their own actions from the player
-process. The game uses quoter when an action is missing or invalid.
+process. Missing or invalid actions are rejected and forfeit the seat's turn
+(no transmission or confirm, no fallback move).
 
 Seats play under **anonymous cog aliases** (Sprocket, Gizmo, …): policy
 display names never reach the agents' prompts. The spectator and replay
@@ -71,8 +72,8 @@ bytes carry the truth and the viewer computes the lie.
 - `src/garble/sim.nim` — pure rules: seeded setup, tickets, confirms,
   settlement, airtime, scoring, endings, replay derivation; shared by
   server, tests, and the wasm viewer
-- `src/garble/llm.nim` — player-side Claude client and baseline decisions;
-  the game uses its quoter rule for missing actions
+- `src/garble/llm.nim` — player-side Claude client, strict JSON decision
+  parsing, and scripted baseline decisions
 - `src/garble/server.nim` — mummy HTTP/WS server (player, global, replay)
 - `src/garble_player.nim` — the prompt and scripted player (`PLAYER_PROMPT` /
   `PLAYER_SCRIPTED` env)
@@ -110,7 +111,7 @@ nim c -d:release -o:bin/garble src/garble.nim
 nim c -d:release -o:bin/garble-player src/garble_player.nim
 nim c --hints:off -d:emscripten replay-viewer/garble_replay.nim  # wasm viewer
 # Set a player-owned Claude credential for model play. Without one the prompt
-# player sends quoter fallback actions without a network call.
+# player is disabled and forfeits its turns without substituting a scripted move.
 ```
 
 Coworld packaging (from a metta checkout):
@@ -131,7 +132,8 @@ The bundled prompt player opts into metered hosted inference with
 `COWORLD_LLM_ENABLED=true` and the explicit model
 `anthropic/claude-haiku-4.5`. Quoter and Shark do not enable inference.
 Custom prompt policies also need the `--use-llm` option below; without hosted
-inference or local provider credentials, the prompt player uses Quoter fallback.
+inference or local provider credentials, the prompt player is disabled and
+forfeits its turns rather than falling back to Quoter.
 
 ## Fielding a policy
 

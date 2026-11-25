@@ -4,7 +4,7 @@
 import
   std/[json, options, os, strutils],
   whisky,
-  garble/[llm, prompts, training_capture]
+  garble/[llm, prompts, sim, training_capture]
 
 const DefaultPrompt = """
 Trade toward your contract commodity and out of your surplus. Price your
@@ -58,19 +58,23 @@ when isMainModule:
                 source = "scripted"
                 scriptedDecisionFromView(view, kind)
               elif client.disabled:
-                source = "fallback"
-                scriptedDecisionFromView(view, skQuoter)
+                raise newException(GarbleError,
+                  "LLM client disabled: no model credentials or auth failed")
               else:
                 choosePromptAction(client, view, prompt,
                   max(1, payload["timeout_ms"].getInt() div 1000 - 1), slot,
                   promptSelection(payload["prompt_config"]),
                   capture)
-          except CatchableError:
+          except CatchableError as error:
             if capture != nil and capture.evidence != nil and capture.evidence.kind != JNull:
               try:
                 socket.send($ %*{"type": "private_attempt", "turn": payload["turn"],
                   "source": source, "private_attempt": capture.evidence})
               except CatchableError: discard
+            try:
+              socket.send($ %*{"type": "decision_failed", "turn": payload["turn"],
+                "reason": safeDiagnostic(error.msg)})
+            except CatchableError: discard
             raise
           socket.send($decisionFrame(payload["turn"], source, action, capture))
         of "final":
